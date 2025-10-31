@@ -1,5 +1,5 @@
 //! Módulo simplificado para manejo de cámaras con Nokhwa
-//! 
+//!
 //! Este módulo proporciona una interfaz simple para:
 //! 1. Detectar cámaras disponibles
 //! 2. Seleccionar una cámara específica
@@ -35,7 +35,7 @@ impl Resolution {
     pub fn new(width: u32, height: u32, fps: u32) -> Self {
         Self { width, height, fps }
     }
-    
+
     pub fn to_string(&self) -> String {
         format!("{}x{} @ {} FPS", self.width, self.height, self.fps)
     }
@@ -63,7 +63,7 @@ impl NokhwaCameraManager {
     /// Escanea y detecta todas las cámaras disponibles
     pub fn scan_cameras(&mut self) -> Result<()> {
         println!("🔍 Escaneando cámaras disponibles...");
-        
+
         // Verificar permisos en Windows
         #[cfg(target_os = "windows")]
         {
@@ -79,7 +79,7 @@ impl NokhwaCameraManager {
         match nokhwa::native_api_backend() {
             Some(backend) => {
                 println!("✅ Backend detectado: {:?}", backend);
-                
+
                 // Escanear cámaras de forma segura
                 self.scan_cameras_safe()?;
             }
@@ -96,7 +96,7 @@ impl NokhwaCameraManager {
     #[cfg(target_os = "windows")]
     fn check_and_request_permissions(&self) -> Result<bool> {
         println!("🔐 Verificando permisos de cámara en Windows...");
-        
+
         match self.permission_manager.try_get_camera_access() {
             PermissionStatus::Granted => {
                 println!("✅ Permisos de cámara concedidos");
@@ -132,7 +132,7 @@ impl NokhwaCameraManager {
         // Enfoque ultra conservador para Windows - solo detectar sin acceder
         if cfg!(target_os = "windows") {
             println!("⚠️  Modo conservador: detectando cámaras sin acceso directo para evitar crashes");
-            
+
             // Agregar cámaras potenciales basadas en el backend detectado
             for i in 0..3 {
                 let camera_info = CameraInfo {
@@ -148,7 +148,7 @@ impl NokhwaCameraManager {
         } else {
             // Para otros sistemas operativos, intentar acceso directo
             let max_cameras = 3;
-            
+
             for i in 0..max_cameras {
                 let camera_info = self.test_camera_access(i)?;
                 self.cameras.push(camera_info);
@@ -157,7 +157,7 @@ impl NokhwaCameraManager {
 
         Ok(())
     }
-    
+
     /// Obtiene resoluciones predeterminadas comunes
     fn get_default_resolutions(&self) -> Vec<Resolution> {
         vec![
@@ -167,7 +167,7 @@ impl NokhwaCameraManager {
             Resolution::new(3840, 2160, 30),  // 4K
         ]
     }
-    
+
     /// Detecta las capacidades de una cámara específica
     pub fn detect_camera_capabilities(&mut self, camera_index: usize) -> Result<()> {
         if camera_index >= self.cameras.len() {
@@ -184,26 +184,26 @@ impl NokhwaCameraManager {
         }
 
         println!("🔍 Detectando capacidades para cámara: {}", self.cameras[camera_index].name);
-        
+
         // Intentar detectar resoluciones soportadas
         let resolutions = self.detect_supported_resolutions(camera_index)?;
         self.cameras[camera_index].supported_resolutions = resolutions;
-        
+
         // Detectar FPS soportados
         let fps_options = self.detect_supported_fps(camera_index)?;
         self.cameras[camera_index].supported_fps = fps_options;
-        
+
         println!("✅ Capacidades detectadas: {} resoluciones, {} opciones de FPS",
                 self.cameras[camera_index].supported_resolutions.len(),
                 self.cameras[camera_index].supported_fps.len());
-        
+
         Ok(())
     }
-    
+
     /// Detecta resoluciones soportadas para una cámara
     fn detect_supported_resolutions(&self, camera_index: usize) -> Result<Vec<Resolution>> {
         let mut resolutions = Vec::new();
-        
+
         // Resoluciones comunes para probar
         let test_resolutions = vec![
             (640, 480),    // VGA
@@ -214,16 +214,16 @@ impl NokhwaCameraManager {
             (2560, 1440),  // QHD 1440p
             (3840, 2160),  // 4K
         ];
-        
+
         let camera_idx = nokhwa::utils::CameraIndex::Index(camera_index as u32);
-        
+
         for (width, height) in test_resolutions {
             // Probar diferentes formatos y FPS
             for fps in [15, 30, 60] {
                 let requested_format = nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
                     nokhwa::utils::RequestedFormatType::HighestFrameRate(fps)
                 );
-                
+
                 // Usar catch_unwind para evitar crashes
                 let test_result = std::panic::catch_unwind(|| {
                     nokhwa::Camera::new(
@@ -231,7 +231,7 @@ impl NokhwaCameraManager {
                         requested_format
                     )
                 });
-                
+
                 match test_result {
                     Ok(Ok(_camera)) => {
                         resolutions.push(Resolution::new(width, height, fps));
@@ -244,34 +244,34 @@ impl NokhwaCameraManager {
                 }
             }
         }
-        
+
         // Si no se detectaron resoluciones, usar predeterminadas
         if resolutions.is_empty() {
             println!("⚠️  No se detectaron resoluciones, usando predeterminadas");
             resolutions = self.get_default_resolutions();
         }
-        
+
         Ok(resolutions)
     }
-    
+
     /// Detecta FPS soportados para una cámara
     fn detect_supported_fps(&self, camera_index: usize) -> Result<Vec<u32>> {
         let mut fps_options = Vec::new();
-        
+
         // FPS comunes para probar
         let test_fps = vec![15, 24, 30, 60, 120];
-        
+
         let camera_idx = nokhwa::utils::CameraIndex::Index(camera_index as u32);
-        
+
         for fps in test_fps {
             let requested_format = nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
                 nokhwa::utils::RequestedFormatType::HighestFrameRate(fps)
             );
-            
+
             let test_result = std::panic::catch_unwind(|| {
                 nokhwa::Camera::new(camera_idx.clone(), requested_format)
             });
-            
+
             match test_result {
                 Ok(Ok(_camera)) => {
                     fps_options.push(fps);
@@ -282,13 +282,13 @@ impl NokhwaCameraManager {
                 }
             }
         }
-        
+
         // Si no se detectaron FPS, usar predeterminados
         if fps_options.is_empty() {
             println!("⚠️  No se detectaron FPS, usando predeterminados");
             fps_options = vec![15, 30, 60];
         }
-        
+
         Ok(fps_options)
     }
 
@@ -356,8 +356,8 @@ impl NokhwaCameraManager {
         }
 
         self.selected_camera = Some(index);
-        println!("✅ Cámara seleccionada: {} ({})", 
-                self.cameras[index].name, 
+        println!("✅ Cámara seleccionada: {} ({})",
+                self.cameras[index].name,
                 self.cameras[index].index);
         Ok(())
     }
@@ -396,7 +396,7 @@ impl VideoStream {
     /// Crea un nuevo stream de video
     pub fn new(camera_index: usize) -> Result<Self> {
         let camera_idx = nokhwa::utils::CameraIndex::Index(camera_index as u32);
-        
+
         // Try different formats to get uncompressed RGB data
         let requested_formats = vec![
             nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
@@ -464,8 +464,8 @@ impl VideoStream {
         if let Some(ref mut camera) = self.camera {
             match camera.frame() {
                 Ok(buffer) => {
-                    println!("📸 Frame capturado: {}x{}", 
-                            buffer.resolution().width(), 
+                    println!("📸 Frame capturado: {}x{}",
+                            buffer.resolution().width(),
                             buffer.resolution().height());
                     Ok(buffer)
                 }
@@ -505,14 +505,14 @@ impl Drop for VideoStream {
 #[allow(dead_code)] // Mantenido para utilidad futura
 pub fn select_best_camera(manager: &NokhwaCameraManager) -> Option<usize> {
     let cameras = manager.list_cameras();
-    
+
     // Buscar la primera cámara accesible
     for (index, camera) in cameras.iter().enumerate() {
         if camera.accessible {
             return Some(index);
         }
     }
-    
+
     None
 }
 
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn test_camera_selection() {
         let mut manager = NokhwaCameraManager::new();
-        
+
         // Intentar seleccionar cámara sin escanear debería fallar
         assert!(manager.select_camera(0).is_err());
     }

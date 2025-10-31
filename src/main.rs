@@ -388,7 +388,6 @@ fn update_frame_with_slint_native(state: &CameraState) -> Result<Option<Image>> 
 
 fn initialize_slint_renderer(state: &CameraState) -> Result<()> {
     let config = SlintRendererConfig {
-        enable_simd: true,
         enable_frame_caching: true,
         adaptive_quality: true,
         max_cache_size: 3,
