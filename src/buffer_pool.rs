@@ -26,6 +26,15 @@ impl SimpleBufferPool {
         }
     }
     
+    /// Limpia buffers no utilizados para liberar memoria
+    pub fn cleanup_unused_buffers(&self) {
+        let mut buffers = self.buffers.lock();
+        // Mantener solo la mitad de los buffers si hay muchos sin usar
+        if buffers.len() > self.max_buffers / 2 {
+            buffers.truncate(self.max_buffers / 2);
+        }
+    }
+    
     /// Obtiene un buffer del pool o crea uno nuevo
     pub fn get_buffer(&self) -> Vec<u8> {
         let mut buffers = self.buffers.lock();
@@ -43,6 +52,10 @@ impl SimpleBufferPool {
         let mut buffers = self.buffers.lock();
         if buffers.len() < self.max_buffers {
             buffer.clear();
+            // Shrink para liberar memoria si es necesario
+            if buffer.capacity() > self.buffer_size * 2 {
+                buffer.shrink_to_fit();
+            }
             buffers.push(buffer);
         }
     }
@@ -144,7 +157,7 @@ impl BufferPoolManager {
     pub fn new() -> Self {
         Self {
             rgba_pools: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            temp_pool: Arc::new(TempBufferPool::new(1920 * 1080 * 4, 10)), // Máximo 1080p RGBA
+            temp_pool: Arc::new(TempBufferPool::new(1920 * 1080 * 4, 5)), // Reducido a 5 buffers
         }
     }
     
@@ -152,11 +165,11 @@ impl BufferPoolManager {
     pub fn get_rgba_pool(&self, width: u32, height: u32) -> Arc<RgbaBufferPool> {
         let mut pools = self.rgba_pools.lock();
         
-        // Para resoluciones altas, usar más buffers para mejor rendimiento
+        // Optimización: usar menos buffers para reducir uso de memoria
         let pool_size = if width * height > 1280 * 720 {
-            10 // Más buffers para resoluciones altas
+            6 // Menos buffers para resoluciones altas
         } else {
-            5 // Buffer estándar para resoluciones normales
+            3 // Buffer reducido para resoluciones normales
         };
         
         pools.entry((width, height))

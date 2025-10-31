@@ -155,23 +155,23 @@ impl AsyncFrameHandler {
             let mut last_process_time = Instant::now();
             
             while *is_running.lock() {
-                match capture_receiver.recv_timeout(Duration::from_millis(5)) {
+                // Aumentar timeout para reducir uso de CPU
+                match capture_receiver.recv_timeout(Duration::from_millis(16)) { // ~60 FPS
                     Ok(buffer) => {
                         let start_time = Instant::now();
                         
-                        // Verificar si debemos procesar este frame (adaptive skipping mucho menos agresivo)
+                        // Frame skipping más agresivo para reducir CPU
                         let time_since_last = start_time.duration_since(last_process_time);
                         let target_frame_time = Duration::from_secs_f64(1.0 / 30.0); // 30 FPS objetivo
                         
-                        // NUNCA saltar frames - siempre procesar para máxima fluidez
-                        // Solo limitar si es extremadamente rápido (más de 60 FPS)
-                        if time_since_last >= target_frame_time * 5 / 10 { // 50% del tiempo objetivo (casi siempre)
-                            // Procesar frame con renderizador optimizado
+                        // Saltar frames si estamos procesando demasiado rápido
+                        if time_since_last >= target_frame_time * 8 / 10 { // 80% del tiempo objetivo
+                            // Procesar frame con métodos nativos de Slint
                             let image = match crate::slint_renderer::render_frame_optimized(&buffer) {
                                 Ok(img) => img,
                                 Err(e) => {
-                                    eprintln!("Error en renderizado optimizado: {}", e);
-                                    // Fallback a procesador estándar
+                                    eprintln!("Error en renderizado nativo: {}", e);
+                                    // Fallback a procesador nativo
                                     match crate::frame_processor::process_frame_optimized(&buffer) {
                                         Ok(img) => img,
                                         Err(e2) => {
@@ -210,7 +210,8 @@ impl AsyncFrameHandler {
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // Timeout normal, continuar
+                        // Timeout normal - añadir pequeño sleep para reducir CPU
+                        std::thread::sleep(Duration::from_millis(1));
                         continue;
                     }
                     Err(_) => {
@@ -290,14 +291,14 @@ impl AsyncFrameHandler {
         let mut last_time = self.last_display_time.lock();
         let time_since_last_display = frame.timestamp.duration_since(*last_time);
         
-        // Target ultra permisivo para máxima fluidez
+        // Target más estricto para reducir CPU
         let target_frame_duration = Duration::from_secs_f64(1.0 / 30.0); // 30 FPS objetivo
         
-        // Adaptive skipping ultra permisivo - casi nunca saltar frames
-        let adjusted_threshold = if frame.processing_time > Duration::from_millis(100) {
-            target_frame_duration * 3 // Solo si es extremadamente lento (>100ms)
+        // Adaptive skipping más agresivo para reducir uso de CPU
+        let adjusted_threshold = if frame.processing_time > Duration::from_millis(50) {
+            target_frame_duration * 2 // Si es lento (>50ms)
         } else {
-            target_frame_duration * 1 // Permitir todos los frames normalmente
+            target_frame_duration * 1 // Permitir frames normales
         };
         
         if time_since_last_display >= adjusted_threshold {

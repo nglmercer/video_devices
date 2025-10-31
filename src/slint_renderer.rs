@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
+use slint::{Image, Rgba8Pixel, Rgb8Pixel, SharedPixelBuffer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use crate::buffer_pool::{get_buffer_pool_manager, RgbaBufferPool};
@@ -81,7 +81,7 @@ impl SlintRenderer {
         self.rgba_pool = Some(get_buffer_pool_manager().get_rgba_pool(width, height));
     }
     
-    /// Renderiza un buffer de nokhwa a imagen Slint con optimizaciones
+    /// Renderiza un buffer de nokhwa a imagen Slint usando métodos nativos
     pub fn render_frame(&mut self, buffer: &nokhwa::buffer::Buffer) -> Result<Image> {
         let start_time = Instant::now();
         
@@ -95,17 +95,16 @@ impl SlintRenderer {
             }
         }
         
-        // Desactivar frame skipping agresivo para mejorar fluidez
-        // Solo saltar si el rendimiento es extremadamente malo
-        if self.should_skip_frame_aggressive() {
-            return Err(anyhow::anyhow!("Frame skipped for extreme performance issues"));
+        // Frame skipping más agresivo para reducir CPU
+        if self.should_skip_frame_optimized() {
+            return Err(anyhow::anyhow!("Frame skipped for performance optimization"));
         }
         
-        // Procesar frame con método optimizado
+        // Procesar frame con métodos nativos de Slint
         let image = if self.config.enable_simd {
-            self.render_frame_simd(buffer)?
+            self.render_frame_native_optimized(buffer)?
         } else {
-            self.render_frame_standard(buffer)?
+            self.render_frame_native_standard(buffer)?
         };
         
         // Actualizar métricas y cache
@@ -122,42 +121,44 @@ impl SlintRenderer {
         Ok(image)
     }
     
-    /// Renderizado con optimizaciones SIMD
-    fn render_frame_simd(&mut self, buffer: &nokhwa::buffer::Buffer) -> Result<Image> {
+    /// Renderizado optimizado usando métodos nativos de Slint
+    fn render_frame_native_optimized(&mut self, buffer: &nokhwa::buffer::Buffer) -> Result<Image> {
         let resolution = buffer.resolution();
         let width = resolution.width() as u32;
         let height = resolution.height() as u32;
         
         // Actualizar pool si es necesario
-        if self.rgba_pool.is_none() || 
+        if self.rgba_pool.is_none() ||
            self.rgba_pool.as_ref().unwrap().buffer_size() != (width * height * 4) as usize {
             self.initialize(width, height);
         }
         
         let image_data = buffer.buffer();
-        let pool = self.rgba_pool.as_ref().unwrap();
         
         // Calcular tamaños esperados
         let expected_rgb = (width * height * 3) as usize;
         let expected_rgba = (width * height * 4) as usize;
         
-        let rgba_data = if image_data.len() == expected_rgb {
-            // RGB → RGBA con SIMD optimizado
-            self.convert_rgb_to_rgba_simd_optimized(image_data, pool)?
+        if image_data.len() == expected_rgb {
+            // RGB → usar from_rgb8 nativo con conversión BGR→RGB
+            let rgb_data = self.convert_bgr_to_rgb_native_optimized(image_data)?;
+            let pixel_buffer = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(&rgb_data, width, height);
+            Ok(Image::from_rgb8(pixel_buffer))
+            
         } else if image_data.len() == expected_rgba {
-            // RGBA → RGBA con posible reordenamiento
-            self.convert_rgba_optimized(image_data, pool)?
+            // RGBA → usar from_rgba8 nativo con conversión BGRA→RGBA
+            let rgba_data = self.convert_bgra_to_rgba_native_optimized(image_data)?;
+            let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba_data, width, height);
+            Ok(Image::from_rgba8(pixel_buffer))
+            
         } else {
-            // MJPEG → RGBA con procesamiento paralelo
-            self.decode_mjpeg_to_rgba_optimized(image_data, width, height)?
-        };
-        
-        // Crear imagen Slint con zero-copy cuando sea posible
-        self.create_slint_image_zero_copy(&rgba_data, width, height)
+            // MJPEG → decodificar y usar métodos nativos
+            self.decode_to_slint_native_optimized(image_data, width, height)
+        }
     }
     
-    /// Renderizado estándar (fallback)
-    fn render_frame_standard(&mut self, buffer: &nokhwa::buffer::Buffer) -> Result<Image> {
+    /// Renderizado estándar usando métodos nativos de Slint
+    fn render_frame_native_standard(&mut self, buffer: &nokhwa::buffer::Buffer) -> Result<Image> {
         let resolution = buffer.resolution();
         let width = resolution.width() as u32;
         let height = resolution.height() as u32;
@@ -166,21 +167,28 @@ impl SlintRenderer {
         let expected_rgb = (width * height * 3) as usize;
         let expected_rgba = (width * height * 4) as usize;
         
-        let rgba_data = if image_data.len() == expected_rgb {
-            // Conversión RGB→RGBA estándar
-            image_data
+        if image_data.len() == expected_rgb {
+            // RGB → usar from_rgb8 nativo con conversión BGR→RGB
+            let rgb_data: Vec<u8> = image_data
                 .chunks_exact(3)
-                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], 255]) // BGR→RGBA
-                .collect()
+                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]]) // BGR→RGB
+                .collect();
+            let pixel_buffer = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(&rgb_data, width, height);
+            Ok(Image::from_rgb8(pixel_buffer))
+            
         } else if image_data.len() == expected_rgba {
-            image_data.to_vec()
+            // RGBA → usar from_rgba8 nativo con conversión BGRA→RGBA
+            let rgba_data: Vec<u8> = image_data
+                .chunks_exact(4)
+                .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]]) // BGRA→RGBA
+                .collect();
+            let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba_data, width, height);
+            Ok(Image::from_rgba8(pixel_buffer))
+            
         } else {
-            // Decodificación MJPEG estándar
-            self.decode_mjpeg_standard(image_data, width, height)?
-        };
-        
-        let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba_data, width, height);
-        Ok(Image::from_rgba8(pixel_buffer))
+            // MJPEG → decodificar y usar métodos nativos
+            self.decode_to_slint_native_standard(image_data, width, height)
+        }
     }
     
     /// Conversión RGB→RGBA SIMD ultra-optimizada
@@ -189,41 +197,59 @@ impl SlintRenderer {
         let pixel_count = rgb_data.len() / 3;
         rgba_buffer.resize(pixel_count * 4, 0);
         
-        // Procesamiento en paralelo con chunks grandes para mejor SIMD
-        let chunk_size = 4096; // Tamaño óptimo para caché L1
-        rgba_buffer.chunks_exact_mut(chunk_size)
-            .enumerate()
-            .par_bridge()
-            .for_each(|(chunk_idx, chunk)| {
-                let start_pixel = chunk_idx * (chunk_size / 4);
-                let start_rgb = start_pixel * 3;
+        // Optimización: usar procesamiento secuencial para reducir overhead
+        let pixel_count = rgb_data.len() / 3;
+        
+        // Para resoluciones bajas, usar procesamiento secuencial
+        if pixel_count <= 640 * 480 {
+            for i in 0..pixel_count {
+                let rgb_idx = i * 3;
+                let rgba_idx = i * 4;
                 
-                for (i, rgba_pixel) in chunk.chunks_exact_mut(4).enumerate() {
-                    let rgb_idx = start_rgb + (i * 3);
-                    if rgb_idx + 2 < rgb_data.len() {
-                        // BGR→RGBA swap optimizado
-                        rgba_pixel[0] = rgb_data[rgb_idx + 2]; // R ← B
-                        rgba_pixel[1] = rgb_data[rgb_idx + 1]; // G ← G
-                        rgba_pixel[2] = rgb_data[rgb_idx];     // B ← R
-                        rgba_pixel[3] = 255;                  // A
-                    }
+                if rgb_idx + 2 < rgb_data.len() && rgba_idx + 3 < rgba_buffer.len() {
+                    rgba_buffer[rgba_idx] = rgb_data[rgb_idx + 2];     // R ← B
+                    rgba_buffer[rgba_idx + 1] = rgb_data[rgb_idx + 1]; // G ← G
+                    rgba_buffer[rgba_idx + 2] = rgb_data[rgb_idx];     // B ← R
+                    rgba_buffer[rgba_idx + 3] = 255;                  // A
                 }
-            });
-        
-        // Procesar remainder
-        let processed_pixels = (pixel_count / (chunk_size / 4)) * (chunk_size / 4);
-        let remainder_start = processed_pixels * 3;
-        let remainder_rgba_start = processed_pixels * 4;
-        
-        for i in processed_pixels..pixel_count {
-            let rgb_idx = remainder_start + ((i - processed_pixels) * 3);
-            let rgba_idx = remainder_rgba_start + ((i - processed_pixels) * 4);
+            }
+        } else {
+            // Para resoluciones altas, usar procesamiento paralelo con chunks más grandes
+            let chunk_size = 8192; // Chunks más grandes para reducir overhead
+            rgba_buffer.chunks_exact_mut(chunk_size)
+                .enumerate()
+                .par_bridge()
+                .for_each(|(chunk_idx, chunk)| {
+                    let start_pixel = chunk_idx * (chunk_size / 4);
+                    let start_rgb = start_pixel * 3;
+                    
+                    for (i, rgba_pixel) in chunk.chunks_exact_mut(4).enumerate() {
+                        let rgb_idx = start_rgb + (i * 3);
+                        if rgb_idx + 2 < rgb_data.len() {
+                            // BGR→RGBA swap optimizado
+                            rgba_pixel[0] = rgb_data[rgb_idx + 2]; // R ← B
+                            rgba_pixel[1] = rgb_data[rgb_idx + 1]; // G ← G
+                            rgba_pixel[2] = rgb_data[rgb_idx];     // B ← R
+                            rgba_pixel[3] = 255;                  // A
+                        }
+                    }
+                });
             
-            if rgb_idx + 2 < rgb_data.len() && rgba_idx + 3 < rgba_buffer.len() {
-                rgba_buffer[rgba_idx] = rgb_data[rgb_idx + 2];
-                rgba_buffer[rgba_idx + 1] = rgb_data[rgb_idx + 1];
-                rgba_buffer[rgba_idx + 2] = rgb_data[rgb_idx];
-                rgba_buffer[rgba_idx + 3] = 255;
+            // Procesar remainder
+            let processed_pixels = (pixel_count / (chunk_size / 4)) * (chunk_size / 4);
+            let remainder_start = processed_pixels * 3;
+            let remainder_rgba_start = processed_pixels * 4;
+            
+            for i in processed_pixels..pixel_count {
+                let rgb_idx = remainder_start + ((i - processed_pixels) * 3);
+                let rgba_idx = remainder_rgba_start + ((i - processed_pixels) * 4);
+                
+                if rgb_idx + 2 < rgb_data.len() && rgba_idx + 3 < rgba_buffer.len() {
+                    rgba_buffer[rgba_idx] = rgb_data[rgb_idx + 2];
+                    rgba_buffer[rgba_idx + 1] = rgb_data[rgb_idx + 1];
+                    rgba_buffer[rgba_idx + 2] = rgb_data[rgb_idx];
+                    rgba_buffer[rgba_idx + 3] = 255;
+                }
             }
         }
         
@@ -321,6 +347,142 @@ impl SlintRenderer {
         Ok(resized_img.into_raw())
     }
     
+    /// Conversión BGR→RGB optimizada usando métodos nativos de Slint
+    fn convert_bgr_to_rgb_native_optimized(&self, bgr_data: &[u8]) -> Result<Vec<u8>> {
+        let pool = self.rgba_pool.as_ref().unwrap();
+        let mut rgb_buffer = pool.get_buffer();
+        
+        let pixel_count = bgr_data.len() / 3;
+        rgb_buffer.resize(pixel_count * 3, 0);
+        
+        // Para resoluciones bajas, usar procesamiento secuencial
+        if pixel_count <= 640 * 480 {
+            for i in 0..pixel_count {
+                let bgr_idx = i * 3;
+                let rgb_idx = i * 3;
+                
+                if bgr_idx + 2 < bgr_data.len() && rgb_idx + 2 < rgb_buffer.len() {
+                    rgb_buffer[rgb_idx] = bgr_data[bgr_idx + 2];     // R ← B
+                    rgb_buffer[rgb_idx + 1] = bgr_data[bgr_idx + 1]; // G ← G
+                    rgb_buffer[rgb_idx + 2] = bgr_data[bgr_idx];     // B ← R
+                }
+            }
+        } else {
+            // Para resoluciones altas, usar procesamiento paralelo
+            let chunk_size = 8192;
+            rgb_buffer.chunks_exact_mut(chunk_size)
+                .enumerate()
+                .par_bridge()
+                .for_each(|(chunk_idx, chunk)| {
+                    let start_pixel = chunk_idx * (chunk_size / 3);
+                    let start_bgr = start_pixel * 3;
+                    
+                    for (i, rgb_pixel) in chunk.chunks_exact_mut(3).enumerate() {
+                        let bgr_idx = start_bgr + (i * 3);
+                        if bgr_idx + 2 < bgr_data.len() {
+                            rgb_pixel[0] = bgr_data[bgr_idx + 2]; // R ← B
+                            rgb_pixel[1] = bgr_data[bgr_idx + 1]; // G ← G
+                            rgb_pixel[2] = bgr_data[bgr_idx];     // B ← R
+                        }
+                    }
+                });
+        }
+        
+        let result = rgb_buffer.clone();
+        pool.return_buffer(rgb_buffer);
+        Ok(result)
+    }
+    
+    /// Conversión BGRA→RGBA optimizada usando métodos nativos de Slint
+    fn convert_bgra_to_rgba_native_optimized(&self, bgra_data: &[u8]) -> Result<Vec<u8>> {
+        let pool = self.rgba_pool.as_ref().unwrap();
+        let mut rgba_buffer = pool.get_buffer();
+        
+        let pixel_count = bgra_data.len() / 4;
+        rgba_buffer.resize(pixel_count * 4, 0);
+        
+        // Para resoluciones bajas, usar procesamiento secuencial
+        if pixel_count <= 640 * 480 {
+            for i in 0..pixel_count {
+                let bgra_idx = i * 4;
+                let rgba_idx = i * 4;
+                
+                if bgra_idx + 3 < bgra_data.len() && rgba_idx + 3 < rgba_buffer.len() {
+                    rgba_buffer[rgba_idx] = bgra_data[bgra_idx + 2];     // R ← B
+                    rgba_buffer[rgba_idx + 1] = bgra_data[bgra_idx + 1]; // G ← G
+                    rgba_buffer[rgba_idx + 2] = bgra_data[bgra_idx];     // B ← R
+                    rgba_buffer[rgba_idx + 3] = bgra_data[bgra_idx + 3]; // A ← A
+                }
+            }
+        } else {
+            // Para resoluciones altas, usar procesamiento paralelo
+            let chunk_size = 8192;
+            rgba_buffer.chunks_exact_mut(chunk_size)
+                .enumerate()
+                .par_bridge()
+                .for_each(|(chunk_idx, chunk)| {
+                    let start_pixel = chunk_idx * (chunk_size / 4);
+                    let start_bgra = start_pixel * 4;
+                    
+                    for (i, rgba_pixel) in chunk.chunks_exact_mut(4).enumerate() {
+                        let bgra_idx = start_bgra + (i * 4);
+                        if bgra_idx + 3 < bgra_data.len() {
+                            rgba_pixel[0] = bgra_data[bgra_idx + 2]; // R ← B
+                            rgba_pixel[1] = bgra_data[bgra_idx + 1]; // G ← G
+                            rgba_pixel[2] = bgra_data[bgra_idx];     // B ← R
+                            rgba_pixel[3] = bgra_data[bgra_idx + 3]; // A ← A
+                        }
+                    }
+                });
+        }
+        
+        let result = rgba_buffer.clone();
+        pool.return_buffer(rgba_buffer);
+        Ok(result)
+    }
+    
+    /// Decodificación optimizada a formatos nativos de Slint
+    fn decode_to_slint_native_optimized(&self, compressed_data: &[u8], target_width: u32, target_height: u32) -> Result<Image> {
+        let img = image::load_from_memory(compressed_data)?;
+        let rgba_img = img.to_rgba8();
+        
+        // Redimensionamiento adaptativo basado en calidad
+        let (final_width, final_height) = if self.config.adaptive_quality {
+            let scale = self.adaptive_quality_level;
+            ((target_width as f32 * scale) as u32, (target_height as f32 * scale) as u32)
+        } else {
+            (target_width, target_height)
+        };
+        
+        let (img_width, img_height) = rgba_img.dimensions();
+        
+        if img_width != final_width || img_height != final_height {
+            let resized_data = self.resize_image_parallel_optimized(&rgba_img, final_width, final_height)?;
+            let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&resized_data, final_width, final_height);
+            Ok(Image::from_rgba8(pixel_buffer))
+        } else {
+            let rgba_data = rgba_img.into_raw();
+            let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba_data, img_width, img_height);
+            Ok(Image::from_rgba8(pixel_buffer))
+        }
+    }
+    
+    /// Decodificación estándar a formatos nativos de Slint
+    fn decode_to_slint_native_standard(&self, compressed_data: &[u8], target_width: u32, target_height: u32) -> Result<Image> {
+        let img = image::load_from_memory(compressed_data)?;
+        let rgba_img = img.to_rgba8();
+        let resized_img = image::imageops::resize(
+            &rgba_img,
+            target_width,
+            target_height,
+            image::imageops::FilterType::Lanczos3
+        );
+        
+        let rgba_data = resized_img.into_raw();
+        let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba_data, target_width, target_height);
+        Ok(Image::from_rgba8(pixel_buffer))
+    }
+    
     /// Creación de imagen Slint con zero-copy cuando sea posible
     fn create_slint_image_zero_copy(&self, rgba_data: &[u8], width: u32, height: u32) -> Result<Image> {
         // Intentar zero-copy si los datos están alineados correctamente
@@ -381,11 +543,13 @@ impl SlintRenderer {
         self.frame_cache.retain(|cached| cached.timestamp.elapsed() < Duration::from_secs(2));
     }
     
-    /// Determina si se debe saltar un frame para mantener rendimiento (solo casos extremos)
-    fn should_skip_frame_aggressive(&self) -> bool {
-        let _time_since_last_frame = self.last_frame_time.elapsed();
-        // NUNCA saltar frames - siempre procesar para máxima fluidez
-        false // Desactivado completamente para evitar tartamudeos
+    /// Determina si se debe saltar un frame para mantener rendimiento
+    fn should_skip_frame_optimized(&self) -> bool {
+        let time_since_last_frame = self.last_frame_time.elapsed();
+        let target_frame_time = Duration::from_secs_f64(1.0 / self.config.target_fps);
+        
+        // Saltar frames si estamos procesando demasiado rápido para reducir CPU
+        time_since_last_frame < target_frame_time * 7 / 10 // 70% del tiempo objetivo
     }
     
     /// Actualiza métricas de rendimiento y ajusta calidad adaptativa
@@ -396,11 +560,11 @@ impl SlintRenderer {
             let avg_time = self.total_processing_time / self.total_frames_processed as u32;
             let target_time = Duration::from_secs_f64(1.0 / self.config.target_fps);
             
-            // Ajuste de calidad menos agresivo para mantener fluidez
-            if avg_time > target_time * 15 / 10 { // Solo si es 50% más lento
-                self.adaptive_quality_level = (self.adaptive_quality_level * 0.95).max(0.5); // Mínimo 0.5
-            } else if avg_time < target_time * 8 / 10 { // Si es 20% más rápido
-                self.adaptive_quality_level = (self.adaptive_quality_level * 1.02).min(1.0);
+            // Ajuste de calidad más agresivo para reducir CPU
+            if avg_time > target_time * 12 / 10 { // Si es 20% más lento
+                self.adaptive_quality_level = (self.adaptive_quality_level * 0.9).max(0.6); // Mínimo 0.6
+            } else if avg_time < target_time * 6 / 10 { // Si es 40% más rápido
+                self.adaptive_quality_level = (self.adaptive_quality_level * 1.05).min(1.0);
             }
         }
     }

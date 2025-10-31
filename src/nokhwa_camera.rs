@@ -19,6 +19,26 @@ pub struct CameraInfo {
     #[allow(dead_code)] // Mantenido para compatibilidad futura
     pub device_path: String,
     pub accessible: bool,
+    pub supported_resolutions: Vec<Resolution>,
+    pub supported_fps: Vec<u32>,
+}
+
+/// Información de resolución soportada
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+impl Resolution {
+    pub fn new(width: u32, height: u32, fps: u32) -> Self {
+        Self { width, height, fps }
+    }
+    
+    pub fn to_string(&self) -> String {
+        format!("{}x{} @ {} FPS", self.width, self.height, self.fps)
+    }
 }
 
 /// Gestor de cámaras basado en Nokhwa
@@ -120,6 +140,8 @@ impl NokhwaCameraManager {
                     name: format!("Cámara {} (Detectada)", i),
                     device_path: format!("camera://{}", i),
                     accessible: i == 0, // Solo la primera como accesible por defecto
+                    supported_resolutions: self.get_default_resolutions(),
+                    supported_fps: vec![15, 30, 60],
                 };
                 self.cameras.push(camera_info);
             }
@@ -134,6 +156,140 @@ impl NokhwaCameraManager {
         }
 
         Ok(())
+    }
+    
+    /// Obtiene resoluciones predeterminadas comunes
+    fn get_default_resolutions(&self) -> Vec<Resolution> {
+        vec![
+            Resolution::new(640, 480, 30),    // VGA
+            Resolution::new(1280, 720, 30),   // HD 720p
+            Resolution::new(1920, 1080, 30),  // Full HD 1080p
+            Resolution::new(3840, 2160, 30),  // 4K
+        ]
+    }
+    
+    /// Detecta las capacidades de una cámara específica
+    pub fn detect_camera_capabilities(&mut self, camera_index: usize) -> Result<()> {
+        if camera_index >= self.cameras.len() {
+            return Err(anyhow!("Índice de cámara inválido: {}", camera_index));
+        }
+
+        if !self.cameras[camera_index].accessible {
+            // Usar capacidades predeterminadas para cámaras no accesibles
+            let default_resolutions = self.get_default_resolutions();
+            let default_fps = vec![15, 30, 60];
+            self.cameras[camera_index].supported_resolutions = default_resolutions;
+            self.cameras[camera_index].supported_fps = default_fps;
+            return Ok(());
+        }
+
+        println!("🔍 Detectando capacidades para cámara: {}", self.cameras[camera_index].name);
+        
+        // Intentar detectar resoluciones soportadas
+        let resolutions = self.detect_supported_resolutions(camera_index)?;
+        self.cameras[camera_index].supported_resolutions = resolutions;
+        
+        // Detectar FPS soportados
+        let fps_options = self.detect_supported_fps(camera_index)?;
+        self.cameras[camera_index].supported_fps = fps_options;
+        
+        println!("✅ Capacidades detectadas: {} resoluciones, {} opciones de FPS",
+                self.cameras[camera_index].supported_resolutions.len(),
+                self.cameras[camera_index].supported_fps.len());
+        
+        Ok(())
+    }
+    
+    /// Detecta resoluciones soportadas para una cámara
+    fn detect_supported_resolutions(&self, camera_index: usize) -> Result<Vec<Resolution>> {
+        let mut resolutions = Vec::new();
+        
+        // Resoluciones comunes para probar
+        let test_resolutions = vec![
+            (640, 480),    // VGA
+            (800, 600),    // SVGA
+            (1024, 768),   // XGA
+            (1280, 720),   // HD 720p
+            (1920, 1080),  // Full HD 1080p
+            (2560, 1440),  // QHD 1440p
+            (3840, 2160),  // 4K
+        ];
+        
+        let camera_idx = nokhwa::utils::CameraIndex::Index(camera_index as u32);
+        
+        for (width, height) in test_resolutions {
+            // Probar diferentes formatos y FPS
+            for fps in [15, 30, 60] {
+                let requested_format = nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
+                    nokhwa::utils::RequestedFormatType::HighestFrameRate(fps)
+                );
+                
+                // Usar catch_unwind para evitar crashes
+                let test_result = std::panic::catch_unwind(|| {
+                    nokhwa::Camera::new(
+                        camera_idx.clone(),
+                        requested_format
+                    )
+                });
+                
+                match test_result {
+                    Ok(Ok(_camera)) => {
+                        resolutions.push(Resolution::new(width, height, fps));
+                        println!("✅ Resolución soportada: {}x{} @ {} FPS", width, height, fps);
+                        break; // Si funciona a este FPS, no necesitamos probar más FPS para esta resolución
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        // Continuar con la siguiente resolución/FPS
+                    }
+                }
+            }
+        }
+        
+        // Si no se detectaron resoluciones, usar predeterminadas
+        if resolutions.is_empty() {
+            println!("⚠️  No se detectaron resoluciones, usando predeterminadas");
+            resolutions = self.get_default_resolutions();
+        }
+        
+        Ok(resolutions)
+    }
+    
+    /// Detecta FPS soportados para una cámara
+    fn detect_supported_fps(&self, camera_index: usize) -> Result<Vec<u32>> {
+        let mut fps_options = Vec::new();
+        
+        // FPS comunes para probar
+        let test_fps = vec![15, 24, 30, 60, 120];
+        
+        let camera_idx = nokhwa::utils::CameraIndex::Index(camera_index as u32);
+        
+        for fps in test_fps {
+            let requested_format = nokhwa::utils::RequestedFormat::new::<nokhwa::pixel_format::RgbFormat>(
+                nokhwa::utils::RequestedFormatType::HighestFrameRate(fps)
+            );
+            
+            let test_result = std::panic::catch_unwind(|| {
+                nokhwa::Camera::new(camera_idx.clone(), requested_format)
+            });
+            
+            match test_result {
+                Ok(Ok(_camera)) => {
+                    fps_options.push(fps);
+                    println!("✅ FPS soportado: {}", fps);
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // Continuar con el siguiente FPS
+                }
+            }
+        }
+        
+        // Si no se detectaron FPS, usar predeterminados
+        if fps_options.is_empty() {
+            println!("⚠️  No se detectaron FPS, usando predeterminados");
+            fps_options = vec![15, 30, 60];
+        }
+        
+        Ok(fps_options)
     }
 
     /// Prueba el acceso a una cámara específica de forma segura
@@ -156,6 +312,8 @@ impl NokhwaCameraManager {
                     name: info.human_name().clone(),
                     device_path: format!("camera://{}", index),
                     accessible: true,
+                    supported_resolutions: self.get_default_resolutions(),
+                    supported_fps: vec![15, 30, 60],
                 })
             }
             Ok(Err(_e)) => {
@@ -164,6 +322,8 @@ impl NokhwaCameraManager {
                     name: format!("Cámara {}", index),
                     device_path: format!("camera://{}", index),
                     accessible: false,
+                    supported_resolutions: self.get_default_resolutions(),
+                    supported_fps: vec![15, 30, 60],
                 })
             }
             Err(_) => {
@@ -173,6 +333,8 @@ impl NokhwaCameraManager {
                     name: format!("Cámara {} (Inaccesible)", index),
                     device_path: format!("camera://{}", index),
                     accessible: false,
+                    supported_resolutions: self.get_default_resolutions(),
+                    supported_fps: vec![15, 30, 60],
                 })
             }
         }
@@ -296,7 +458,7 @@ impl VideoStream {
     /// Captura un frame de la cámara
     pub fn capture_frame(&mut self) -> Result<nokhwa::buffer::Buffer> {
         if !self.is_running {
-            return Err(anyhow!("El stream de video no está iniciado"));
+            return Err(anyhow!("El stream de video no esta iniciado"));
         }
 
         if let Some(ref mut camera) = self.camera {

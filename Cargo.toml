@@ -4,6 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "Sistema simplificado de cámaras usando Nokhwa"
 
+# Optimizaciones de rendimiento para release
+[profile.release]
+lto = true              # Link Time Optimization
+codegen-units = 1       # Mejor optimización
+panic = "abort"         # Reduce tamaño binario
+strip = true            # Elimina símbolos de depuración
+opt-level = 3           # Máxima optimización
+
+[profile.dev]
+opt-level = 1           # Optimizaciones básicas en debug
+debug = true
+
 [dependencies]
 # Core dependencies
 anyhow = "1.0"
@@ -45,6 +57,9 @@ windows = { version = "0.52", features = [
 [[bin]]
 name = "rust_video_devices"
 path = "src/main.rs"
+
+# Script de compilación optimizado
+build = "build_optimized.rs"
 
 [build-dependencies]
 slint-build = "1.14"

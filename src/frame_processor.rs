@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use rayon::prelude::*;
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
+use slint::{Image, Rgba8Pixel, Rgb8Pixel, SharedPixelBuffer};
 use std::sync::Arc;
 use crate::buffer_pool::{get_buffer_pool_manager, RgbaBufferPool};
 
@@ -33,40 +33,42 @@ impl FrameProcessor {
         }
     }
     
-    /// Procesa un buffer de nokhwa y lo convierte a imagen Slint optimizada
+    /// Procesa un buffer de nokhwa y lo convierte a imagen Slint usando métodos nativos
     pub fn process_frame(&mut self, buffer: &nokhwa::buffer::Buffer) -> Result<Image> {
         let resolution = buffer.resolution();
         let width = resolution.width() as u32;
         let height = resolution.height() as u32;
-        
-        // Actualizar pools si el tamaño cambió
-        if width != self.width || height != self.height {
-            self.width = width;
-            self.height = height;
-            self.rgba_pool = Some(get_buffer_pool_manager().get_rgba_pool(width, height));
-        }
-        
         let image_data = buffer.buffer();
         
-        // Calcular tamaños esperados
+        // Calcular tamaños
         let expected_rgb = (width * height * 3) as usize;
         let expected_rgba = (width * height * 4) as usize;
         
-        // Convertir a formato RGBA usando el método apropiado
-        let rgba_data = if image_data.len() == expected_rgb {
-            // RGB → RGBA con optimización SIMD
-            self.convert_rgb_to_rgba_simd(image_data)?
+        // Usar métodos nativos de Slint para conversión óptima
+        if image_data.len() == expected_rgb {
+            // ✅ RGB directo - usar from_rgb8 con conversión BGR→RGB
+            let rgb_data = self.convert_bgr_to_rgb_native(image_data)?;
+            let pixel_buffer = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(
+                &rgb_data,
+                width,
+                height
+            );
+            return Ok(Image::from_rgb8(pixel_buffer));
+            
         } else if image_data.len() == expected_rgba {
-            // Ya está en RGBA, solo copiar
-            self.copy_rgba_data(image_data)?
+            // ✅ RGBA directo - usar from_rgba8 con conversión BGRA→RGBA
+            let rgba_data = self.convert_bgra_to_rgba_native(image_data)?;
+            let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                &rgba_data,
+                width,
+                height
+            );
+            return Ok(Image::from_rgba8(pixel_buffer));
+            
         } else {
-            // Formato comprimido (MJPEG) → RGBA
-            self.decode_mjpeg_to_rgba(image_data, width, height)?
-        };
-        
-        // Crear imagen Slint desde el buffer procesado
-        let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba_data, width, height);
-        Ok(Image::from_rgba8(pixel_buffer))
+            // MJPEG - decodificar y convertir usando métodos nativos
+            self.decode_to_slint_native(image_data, width, height)
+        }
     }
     
     /// Convierte RGB a RGBA usando SIMD real cuando esté disponible
@@ -89,6 +91,11 @@ impl FrameProcessor {
             } else if is_x86_feature_detected!("sse4.1") {
                 return self.convert_rgb_to_rgba_sse41(rgb_data, &mut rgba_buffer, pool);
             }
+        }
+        
+        // Optimización: para resoluciones bajas, usar procesamiento secuencial más eficiente
+        if pixel_count <= 640 * 480 {
+            return self.convert_rgb_to_rgba_sequential(rgb_data, &mut rgba_buffer, pool);
         }
         
         // Fallback a procesamiento paralelo optimizado
@@ -250,6 +257,29 @@ impl FrameProcessor {
         Ok(result)
     }
     
+    /// Conversión RGB→RGBA secuencial optimizada para resoluciones bajas
+    fn convert_rgb_to_rgba_sequential(&self, rgb_data: &[u8], rgba_buffer: &mut Vec<u8>, pool: &RgbaBufferPool) -> Result<Vec<u8>> {
+        let pixel_count = rgb_data.len() / 3;
+        
+        // Procesamiento secuencial con acceso lineal óptimo
+        for i in 0..pixel_count {
+            let rgb_idx = i * 3;
+            let rgba_idx = i * 4;
+            
+            if rgb_idx + 2 < rgb_data.len() && rgba_idx + 3 < rgba_buffer.len() {
+                // BGR→RGBA swap con acceso directo
+                rgba_buffer[rgba_idx] = rgb_data[rgb_idx + 2];     // R ← B
+                rgba_buffer[rgba_idx + 1] = rgb_data[rgb_idx + 1]; // G ← G
+                rgba_buffer[rgba_idx + 2] = rgb_data[rgb_idx];     // B ← R
+                rgba_buffer[rgba_idx + 3] = 255;                  // A
+            }
+        }
+        
+        let result = rgba_buffer.clone();
+        pool.return_buffer(rgba_buffer.clone());
+        Ok(result)
+    }
+    
     /// Procesa el remainder de píxeles que no caben en los chunks SIMD
     fn process_rgb_remainder(&self, rgb_data: &[u8], rgba_buffer: &mut [u8]) {
         for (i, rgba_pixel) in rgba_buffer.chunks_exact_mut(4).enumerate() {
@@ -344,6 +374,86 @@ impl FrameProcessor {
         let result = dest_buffer.clone();
         pool.return_buffer(dest_buffer);
         Ok(result)
+    }
+    /// Convierte BGR a RGB usando métodos nativos de Slint
+    fn convert_bgr_to_rgb_native(&self, bgr_data: &[u8]) -> Result<Vec<u8>> {
+        let pool = self.rgba_pool.as_ref().unwrap();
+        let mut rgb_buffer = pool.get_buffer();
+        
+        let pixel_count = bgr_data.len() / 3;
+        rgb_buffer.resize(pixel_count * 3, 0);
+        
+        // Conversión BGR→RGB optimizada
+        for i in 0..pixel_count {
+            let bgr_idx = i * 3;
+            let rgb_idx = i * 3;
+            
+            if bgr_idx + 2 < bgr_data.len() && rgb_idx + 2 < rgb_buffer.len() {
+                rgb_buffer[rgb_idx] = bgr_data[bgr_idx + 2];     // R ← B
+                rgb_buffer[rgb_idx + 1] = bgr_data[bgr_idx + 1]; // G ← G
+                rgb_buffer[rgb_idx + 2] = bgr_data[bgr_idx];     // B ← R
+            }
+        }
+        
+        let result = rgb_buffer.clone();
+        pool.return_buffer(rgb_buffer);
+        Ok(result)
+    }
+    
+    /// Convierte BGRA a RGBA usando métodos nativos de Slint
+    fn convert_bgra_to_rgba_native(&self, bgra_data: &[u8]) -> Result<Vec<u8>> {
+        let pool = self.rgba_pool.as_ref().unwrap();
+        let mut rgba_buffer = pool.get_buffer();
+        
+        let pixel_count = bgra_data.len() / 4;
+        rgba_buffer.resize(pixel_count * 4, 0);
+        
+        // Conversión BGRA→RGBA optimizada
+        for i in 0..pixel_count {
+            let bgra_idx = i * 4;
+            let rgba_idx = i * 4;
+            
+            if bgra_idx + 3 < bgra_data.len() && rgba_idx + 3 < rgba_buffer.len() {
+                rgba_buffer[rgba_idx] = bgra_data[bgra_idx + 2];     // R ← B
+                rgba_buffer[rgba_idx + 1] = bgra_data[bgra_idx + 1]; // G ← G
+                rgba_buffer[rgba_idx + 2] = bgra_data[bgra_idx];     // B ← R
+                rgba_buffer[rgba_idx + 3] = bgra_data[bgra_idx + 3]; // A ← A
+            }
+        }
+        
+        let result = rgba_buffer.clone();
+        pool.return_buffer(rgba_buffer);
+        Ok(result)
+    }
+    
+    /// Decodifica a formatos nativos de Slint
+    fn decode_to_slint_native(&self, compressed_data: &[u8], target_width: u32, target_height: u32) -> Result<Image> {
+        match image::load_from_memory(compressed_data) {
+            Ok(img) => {
+                // Convertir a RGBA8 primero
+                let rgba_img = img.to_rgba8();
+                
+                // Redimensionar si es necesario
+                let final_img = if rgba_img.dimensions() != (target_width, target_height) {
+                    image::imageops::resize(
+                        &rgba_img,
+                        target_width,
+                        target_height,
+                        image::imageops::FilterType::Lanczos3
+                    )
+                } else {
+                    rgba_img
+                };
+                
+                // Crear imagen Slint usando método nativo from_rgba8
+                let rgba_data = final_img.into_raw();
+                let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba_data, target_width, target_height);
+                Ok(Image::from_rgba8(pixel_buffer))
+            }
+            Err(e) => {
+                Err(anyhow::anyhow!("Failed to decode compressed image: {}", e))
+            }
+        }
     }
 }
 
