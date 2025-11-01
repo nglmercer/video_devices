@@ -26,14 +26,7 @@ impl SimpleBufferPool {
         }
     }
 
-    /// Limpia buffers no utilizados para liberar memoria
-    pub fn cleanup_unused_buffers(&self) {
-        let mut buffers = self.buffers.lock();
-        // Mantener solo la mitad de los buffers si hay muchos sin usar
-        if buffers.len() > self.max_buffers / 2 {
-            buffers.truncate(self.max_buffers / 2);
-        }
-    }
+
 
     /// Obtiene un buffer del pool o crea uno nuevo
     pub fn get_buffer(&self) -> Vec<u8> {

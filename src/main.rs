@@ -75,6 +75,20 @@ impl RenderPerformanceStats {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Test mode: Try camera detection without UI first
+    println!("🧪 Testing camera detection without UI...");
+
+    match test_camera_detection_only() {
+        Ok(_) => {
+            println!("✅ Camera detection test passed");
+            println!("🚀 Starting UI mode...");
+        }
+        Err(e) => {
+            eprintln!("❌ Camera detection test failed: {}", e);
+            return Err(e);
+        }
+    }
+
     let ui = CameraView::new()?;
     let camera_state = CameraState::new();
 
@@ -447,4 +461,73 @@ fn update_fps_counter_optimized(state: &CameraState, ui: &CameraView) {
             ui.set_fps(stats.current_fps as i32);
         }
     }
+}
+
+/// Test camera detection without UI to isolate access violation
+fn test_camera_detection_only() -> Result<()> {
+    println!("🔍 Testing camera detection in isolation...");
+
+    // Test 1: Basic camera manager creation
+    let manager = NokhwaCameraManager::new();
+    println!("✅ Camera manager created successfully");
+
+    // Test 2: Camera scanning
+    let mut manager = manager;
+    println!("🔄 Starting camera scan...");
+    match manager.scan_cameras() {
+        Ok(count) => {
+            println!("✅ Camera scan successful: {} cameras found", count);
+            println!("🔄 Scan completed successfully, testing list_cameras...");
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("Camera scan failed: {}", e));
+        }
+    }
+
+    println!("🔄 About to call list_cameras...");
+    // Test 3: List cameras
+    let cameras = manager.list_cameras();
+    println!("✅ Camera list successful:");
+    for (i, camera) in cameras.iter().enumerate() {
+        println!("  {}. {}", i + 1, camera.name);
+    }
+    println!("🔄 Camera listing completed...");
+
+    // Test 4: Try to select the first camera
+    let camera_list = manager.list_cameras();
+    println!("🔄 About to test camera selection, cameras available: {}", camera_list.len());
+    if !camera_list.is_empty() {
+        println!("🔄 Attempting to select first camera...");
+        match manager.select_camera(0) {
+            Ok(()) => {
+                println!("✅ Camera selection successful");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Camera selection failed: {}", e));
+            }
+        }
+    } else {
+        println!("ℹ️  No cameras available for selection test");
+    }
+
+    // Test 5: Try to create a video stream (this is likely where the issue occurs)
+    if !manager.list_cameras().is_empty() {
+        println!("🎥 Testing video stream creation...");
+        match VideoStream::new(0) {
+            Ok(stream) => {
+                println!("✅ Video stream created successfully");
+                println!("🔄 About to drop video stream...");
+                drop(stream);
+                println!("🔄 Video stream dropped successfully");
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Video stream creation failed: {}", e));
+            }
+        }
+    } else {
+        println!("ℹ️  Skipping video stream test - no cameras available");
+    }
+
+    println!("✅ All camera tests passed successfully");
+    Ok(())
 }
