@@ -1,0 +1,19 @@
+export struct CameraInfo {
+  index: string,
+  name: string,
+}
+
+export enum StatusState {
+  error,
+  normal,
+  success,
+}
+
+export global CameraManager {
+    in property <[CameraInfo]> cameras;
+    in property <image> camera-frame;
+    in property <int> fps;
+    in property <bool> is-camera-active;
+    in property <bool> is-streaming;
+    in-out property <CameraInfo> selected-camera;
+}

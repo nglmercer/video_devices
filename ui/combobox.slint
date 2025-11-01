@@ -1,0 +1,17 @@
+import { CameraInfo } from "globals.slint";
+import { Button } from "std-widgets.slint";
+
+export component CamerasComboBox {
+    in property <[CameraInfo]> cameras: [];
+    in property <bool> enabled: true;
+    in-out property <CameraInfo> selected;
+
+    HorizontalLayout {
+        for camera in cameras: Button {
+            text: camera.name;
+            clicked => {
+                selected = camera;
+            }
+        }
+    }
+}

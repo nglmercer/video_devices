@@ -1,358 +1,246 @@
-mod nokhwa_camera;
 mod buffer_pool;
-mod frame_processor;
-mod async_frame_handler;
+mod nokhwa_camera;
 mod slint_renderer;
-mod direct_preview;
 
-// Windows permissions eliminados para simplificar la detección de cámaras
-
-use nokhwa_camera::{NokhwaCameraManager, VideoStream};
-use slint::{Image, SharedPixelBuffer};
-use std::sync::Arc;
+use anyhow::{anyhow, Result};
+use core::fmt;
+use nokhwa::utils::{ApiBackend, CameraInfo};
+use slint::{ComponentHandle, VecModel};
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
-use anyhow::{Result, anyhow};
-use parking_lot::Mutex as ParkingMutex;
 
+use crate::nokhwa_camera::CameraIndex;
 
-
-slint::include_modules!();
-
-#[derive(Clone)]
-struct CameraState {
-    manager: Arc<ParkingMutex<NokhwaCameraManager>>,
-    stream: Arc<ParkingMutex<Option<VideoStream>>>,
-    current_camera: Arc<ParkingMutex<Option<usize>>>,
-    is_streaming: Arc<ParkingMutex<bool>>,
-    frame_count: Arc<ParkingMutex<u32>>,
-    last_fps_update: Arc<ParkingMutex<Instant>>,
-    render_performance_stats: Arc<ParkingMutex<RenderPerformanceStats>>,
-}
-
-// Modo simplificado: Solo Direct para máxima velocidad
-
-#[derive(Debug, Default)]
-struct RenderPerformanceStats {
-    frames_rendered: u64,
-    frames_skipped: u64,
-    total_render_time: Duration,
-    average_render_time: Duration,
-    current_fps: f64,
-}
-
-impl CameraState {
-    fn new() -> Self {
-        Self {
-            manager: Arc::new(ParkingMutex::new(NokhwaCameraManager::new())),
-            stream: Arc::new(ParkingMutex::new(None)),
-            current_camera: Arc::new(ParkingMutex::new(None)),
-            is_streaming: Arc::new(ParkingMutex::new(false)),
-            frame_count: Arc::new(ParkingMutex::new(0)),
-            last_fps_update: Arc::new(ParkingMutex::new(Instant::now())),
-            render_performance_stats: Arc::new(ParkingMutex::new(RenderPerformanceStats::default())),
-
-        }
-    }
-}
-
-impl RenderPerformanceStats {
-    fn update(&mut self, render_time: Duration) {
-        self.frames_rendered += 1;
-        self.total_render_time += render_time;
-        self.average_render_time = self.total_render_time / self.frames_rendered as u32;
-
-        if self.frames_rendered % 30 == 0 {
-            self.current_fps = 30.0 / render_time.as_secs_f64();
-        }
-    }
-
-    fn should_skip_frame(&self, target_fps: f64) -> bool {
-        let target_frame_time = Duration::from_secs_f64(1.0 / target_fps);
-        self.average_render_time > target_frame_time * 9 / 10
-    }
+pub mod ui {
+    slint::include_modules!();
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Modo UI directo - detección simplificada de cámaras
-    println!("🚀 Iniciando aplicación con detección directa de cámaras...");
+    let ui = App::new()?;
+    ui.run()
+}
 
-    let ui = CameraView::new()?;
-    let camera_state = CameraState::new();
+pub enum StatusState {
+    Error(String),
+    Normal(String),
+    Success(String),
+}
 
-    let ui_weak_refresh = ui.as_weak();
-    let ui_weak_start = ui.as_weak();
-    let ui_weak_stop = ui.as_weak();
-    let ui_weak_update = ui.as_weak();
-    let _ui_weak_preview_mode = ui.as_weak();
+struct AppWeak {
+    state: Weak<AppState>,
+    window: slint::Weak<ui::App>,
+}
 
-    let camera_state_refresh = camera_state.clone();
-    let camera_state_start = camera_state.clone();
-    let camera_state_stop = camera_state.clone();
-    let camera_state_update = camera_state.clone();
-    let camera_state_initial = camera_state.clone();
-    let _camera_state_preview_mode = camera_state.clone();
+impl AppWeak {
+    pub fn upgrade(&self) -> Option<App> {
+        let window = self.window.upgrade()?;
+        let state = self.state.upgrade()?;
 
-    ui.on_refresh_cameras(move || {
-        let ui = ui_weak_refresh.upgrade().unwrap();
-        let state = camera_state_refresh.clone();
+        Some(App { state, window })
+    }
+}
 
-        match refresh_camera_list(&state) {
-            Ok(camera_names) => {
-                let count = camera_names.len();
-                let model: Vec<slint::SharedString> = camera_names.into_iter()
-                    .map(|name| name.into())
-                    .collect();
-                ui.set_cameras(slint::ModelRc::from(model.as_slice()));
-                ui.set_status_text(format!("Found {} cameras", count).into());
+struct AppState {
+    cameras: RefCell<Vec<CameraInfo>>,
+    current_camera: RefCell<Option<nokhwa::Camera>>,
+}
+
+struct App {
+    window: ui::App,
+    state: Rc<AppState>,
+}
+
+impl App {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            window: ui::App::new()?,
+
+            state: Rc::new(AppState {
+                cameras: RefCell::new(Vec::new()),
+                current_camera: RefCell::new(None),
+            }),
+        })
+    }
+
+    fn camera_manager(&self) -> ui::CameraManager<'_> {
+        self.window.global::<ui::CameraManager>()
+    }
+
+    fn set_status(&self, state: StatusState) {
+        match state {
+            StatusState::Error(s) => {
+                self.window.set_status_text(s.into());
+                self.window.set_status_state(ui::StatusState::Error);
             }
-            Err(e) => {
-                eprintln!("Error refreshing cameras: {}", e);
-                ui.set_status_text(format!("Error: {}", e).into());
+            StatusState::Normal(s) => {
+                self.window.set_status_text(s.into());
+                self.window.set_status_state(ui::StatusState::Normal);
             }
-        }
-    });
-
-    ui.on_start_camera(move || {
-        let ui = ui_weak_start.upgrade().unwrap();
-        let state = camera_state_start.clone();
-
-        let selected_index = ui.get_selected_camera_index() as usize;
-
-        {
-            let manager = state.manager.lock();
-            let cameras = manager.list_cameras();
-
-            if let Some(camera) = cameras.get(selected_index) {
-                let camera_name = camera.name.clone();
-                drop(manager);
-                if let Err(e) = select_camera_by_name(&state, &camera_name) {
-                    eprintln!("Error selecting camera: {}", e);
-                    ui.set_status_text(format!("Error: {}", e).into());
-                    return;
-                }
-            } else {
-                ui.set_status_text("Camera not found".into());
-                return;
+            StatusState::Success(s) => {
+                self.window.set_status_text(s.into());
+                self.window.set_status_state(ui::StatusState::Success);
             }
-        }
-
-        match start_camera_stream(&state) {
-            Ok(_) => {
-                ui.set_camera_active(true);
-                ui.set_status_text("Camera started successfully".into());
-                ui.set_is_streaming(true);
-
-                *state.frame_count.lock() = 0;
-                *state.last_fps_update.lock() = Instant::now();
-            }
-            Err(e) => {
-                eprintln!("Error starting camera: {}", e);
-                ui.set_status_text(format!("Error: {}", e).into());
-            }
-        }
-    });
-
-    ui.on_stop_camera(move || {
-        let ui = ui_weak_stop.upgrade().unwrap();
-        let state = camera_state_stop.clone();
-
-        // Handlers no se usan en modo Direct
-
-        if let Err(e) = stop_camera_stream(&state) {
-            eprintln!("Error stopping camera: {}", e);
-        }
-
-        ui.set_camera_active(false);
-        ui.set_status_text("Camera stopped".into());
-        ui.set_is_streaming(false);
-        ui.set_fps(0);
-        ui.set_camera_frame(Image::from_rgba8(SharedPixelBuffer::new(1, 1)));
-    });
-
-    ui.on_update_frame(move || {
-        let state = camera_state_update.clone();
-
-        if !*state.is_streaming.lock() {
-            return;
-        }
-
-        if let Some(ui) = ui_weak_update.upgrade() {
-            // Preview directa sin delay (único modo disponible)
-            match update_frame_direct_preview(&state) {
-                Ok(Some(image)) => {
-                    ui.set_camera_frame(image);
-                    update_fps_counter_optimized(&state, &ui);
-                }
-                Ok(None) => {
-                    // No hay frame disponible, continuar sin espera
-                }
-                Err(e) => {
-                    eprintln!("Frame error: {}", e);
-                    ui.set_status_text(format!("Frame error: {}", e).into());
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
-        }
-    });
-
-
-
-    match refresh_camera_list(&camera_state_initial) {
-        Ok(camera_names) => {
-            let count = camera_names.len();
-            let model: Vec<slint::SharedString> = camera_names.into_iter()
-                .map(|name| name.into())
-                .collect();
-            ui.set_cameras(slint::ModelRc::from(model.as_slice()));
-            ui.set_status_text(format!("Ready - {} cameras found", count).into());
-        }
-        Err(e) => {
-            eprintln!("Error initial camera scan: {}", e);
-            ui.set_status_text(format!("Error: {}", e).into());
         }
     }
 
-    ui.run()?;
-    Ok(())
-}
+    fn set_error_status(&self, e: &impl fmt::Display) {
+        self.set_status(StatusState::Error(format!("Error: {e}")));
+    }
 
-fn refresh_camera_list(state: &CameraState) -> Result<Vec<String>> {
-    let mut manager = state.manager.lock();
-    manager.scan_cameras()?;
+    pub fn as_weak(&self) -> AppWeak {
+        AppWeak {
+            state: Rc::downgrade(&self.state),
+            window: self.window.as_weak(),
+        }
+    }
 
-    let cameras = manager.list_cameras();
-    let camera_names: Vec<String> = cameras.iter()
-        .map(|c| c.name.clone())
-        .collect();
+    fn scan_cameras(&self) -> Result<()> {
+        self.state.cameras.borrow_mut().clear();
 
-    println!("Found {} cameras", camera_names.len());
-    Ok(camera_names)
-}
+        let camera_infos =
+            nokhwa::query(ApiBackend::Auto).map_err(|e| anyhow!("Cannot detect cameras: {e}"))?;
 
-fn select_camera_by_name(state: &CameraState, camera_name: &str) -> Result<()> {
-    let mut manager = state.manager.lock();
-    let cameras = manager.list_cameras();
+        *self.state.cameras.borrow_mut() = camera_infos;
 
-    for (index, camera) in cameras.iter().enumerate() {
-        if camera.name == camera_name {
-            manager.select_camera(index)?;
-            let mut current = state.current_camera.lock();
-            *current = Some(index);
-            println!("Selected camera: {}", camera_name);
+        Ok(())
+    }
+
+    fn refresh_camera_list(&self) {
+        if let Err(e) = self.scan_cameras() {
+            eprintln!("Error refreshing cameras: {e}");
+            self.set_error_status(&e);
+        }
+
+        let cameras = self.state.cameras.borrow();
+        let count = cameras.len();
+        let cameras: VecModel<ui::CameraInfo> = cameras
+            .iter()
+            .map(|c| ui::CameraInfo {
+                index: c.index().as_string().into(),
+                name: c.human_name().into(),
+            })
+            .collect();
+
+        println!("Found {count} cameras");
+
+        self.camera_manager()
+            .set_cameras(slint::ModelRc::new(cameras));
+        self.set_status(StatusState::Normal(format!("Found {count} cameras")));
+    }
+
+    fn get_camera_frame(&self) -> Result<()> {
+        let Some(ref mut camera) = *self.state.current_camera.borrow_mut() else {
             return Ok(());
+        };
+
+        let start_time = Instant::now();
+
+        let buffer = camera
+            .frame()
+            .map_err(|e| anyhow!("Capturing frame: {e}"))?;
+
+        let image = slint_renderer::render_frame(&buffer)?;
+
+        let render_time = start_time.elapsed();
+        let fps = 1.0 / render_time.as_secs_f64();
+
+        self.camera_manager().set_camera_frame(image);
+
+        if fps > 0.0 {
+            self.camera_manager().set_fps(fps.trunc() as i32);
         }
+
+        Ok(())
     }
 
-    Err(anyhow::anyhow!("Camera '{}' not found", camera_name))
-}
-
-fn start_camera_stream(state: &CameraState) -> Result<()> {
-    println!("🎥 Starting camera...");
-
-    let manager = state.manager.lock();
-    let camera_index = manager.get_selected_camera()
-        .ok_or_else(|| anyhow::anyhow!("No camera selected"))?
-        .index;
-
-    drop(manager);
-
-    match VideoStream::new(camera_index) {
-        Ok(mut video_stream) => {
-            video_stream.start()?;
-            println!("✅ Camera started successfully");
-
-            {
-                let mut stream_guard = state.stream.lock();
-                *stream_guard = Some(video_stream);
+    pub fn run(self) -> Result<()> {
+        self.window.on_refresh_cameras({
+            let app = self.as_weak();
+            move || {
+                app.upgrade().unwrap().refresh_camera_list();
             }
+        });
 
-            {
-                let mut streaming = state.is_streaming.lock();
-                *streaming = true;
-            }
+        self.window.on_start_camera({
+            let app = self.as_weak();
 
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("❌ Error creating camera stream: {}", e);
-            Err(e)
-        }
-    }
-}
+            move || {
+                let app = app.upgrade().unwrap();
 
-fn stop_camera_stream(state: &CameraState) -> Result<()> {
-    {
-        let mut streaming = state.is_streaming.lock();
-        *streaming = false;
-    }
+                let selected_index = app.camera_manager().get_selected_camera().index;
+                let selected_index = CameraIndex(selected_index.to_string());
 
-    let mut stream = state.stream.lock();
-    if let Some(ref mut video_stream) = *stream {
-        video_stream.stop()?;
-    }
-    *stream = None;
+                let cameras = app.state.cameras.borrow();
+                let Some(camera) = cameras.iter().find(|c| &selected_index == c.index()) else {
+                    app.set_error_status(&"Camera not found");
+                    return;
+                };
 
-    let mut current = state.current_camera.lock();
-    *current = None;
+                println!("Selected camera: {selected_index}");
 
-    println!("Camera stream stopped");
-    Ok(())
-}
+                println!("🎥 Starting camera...");
 
+                match nokhwa_camera::create_camera_stream(camera.index().clone()) {
+                    Ok(camera_stream) => {
+                        println!("✅ Camera started successfully");
 
+                        *app.state.current_camera.borrow_mut() = Some(camera_stream);
 
-/// Preview directa con latencia mínima (~1-2ms)
-fn update_frame_direct_preview(state: &CameraState) -> Result<Option<Image>> {
-    let start_time = Instant::now();
-
-    let buffer = {
-        let mut stream = state.stream.lock();
-        if let Some(ref mut video_stream) = *stream {
-            match video_stream.capture_frame() {
-                Ok(buffer) => buffer,
-                Err(e) => {
-                    return Err(anyhow!("Error capturando frame: {}", e));
+                        app.set_status(StatusState::Normal("Camera started successfully".into()));
+                        app.camera_manager().set_is_camera_active(true);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Error creating camera stream: {e}");
+                        app.set_error_status(&e);
+                    }
                 }
             }
-        } else {
-            return Err(anyhow!("No video stream disponible"));
-        }
-    };
+        });
 
-    // Conversión directa sin buffering usando métodos nativos de Slint
-    let image = direct_preview::convert_frame_to_slint(&buffer)?;
+        self.window.on_stop_camera({
+            let app = self.as_weak();
 
-    let render_time = start_time.elapsed();
+            move || {
+                let app = app.upgrade().unwrap();
 
-    // Actualizar métricas
-    {
-        let mut stats = state.render_performance_stats.lock();
-        stats.frames_rendered += 1;
-        stats.total_render_time += render_time;
-        stats.average_render_time = stats.total_render_time / stats.frames_rendered as u32;
+                *app.state.current_camera.borrow_mut() = None;
 
-        // Calcular FPS actual
-        if stats.frames_rendered % 30 == 0 {
-            stats.current_fps = 1.0 / render_time.as_secs_f64();
-        }
+                app.camera_manager().set_is_camera_active(false);
+                app.camera_manager().set_is_streaming(false);
+                app.set_status(StatusState::Normal("Camera stopped".into()));
+                app.window.invoke_refresh_pause_icon();
+            }
+        });
+
+        self.window.on_update_frame({
+            let app = self.as_weak();
+            move || {
+                let app = app.upgrade().unwrap();
+                if !app.camera_manager().get_is_streaming() {
+                    app.camera_manager().set_is_streaming(true);
+
+                    let window = app.as_weak().window.clone();
+
+                    std::thread::spawn(move || {
+                        // Arbitraty value to wait camera framerate and busy thread to stabilize
+                        // see more in `control.slint`
+                        std::thread::sleep(Duration::from_millis(500));
+                        window.upgrade_in_event_loop(|w| w.invoke_refresh_pause_icon())
+                    });
+                }
+
+                if let Err(e) = app.get_camera_frame() {
+                    eprintln!("Frame error: {e}");
+                    app.set_error_status(&e);
+                }
+            }
+        });
+
+        self.refresh_camera_list();
+
+        self.window.run()?;
+        Ok(())
     }
-
-    Ok(Some(image))
 }
-
-
-
-
-fn update_fps_counter_optimized(state: &CameraState, ui: &CameraView) {
-    // FPS calculado desde render_performance_stats en modo Direct
-
-    {
-        let stats = state.render_performance_stats.lock();
-        if stats.current_fps > 0.0 {
-            ui.set_fps(stats.current_fps as i32);
-        }
-    }
-}
-
-// Función de test eliminada - aplicación simplificada

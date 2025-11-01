@@ -1,0 +1,112 @@
+export component PauseIcon inherits Path {
+    in property <duration> duration: 250ms;
+    in property <bool> is-play;
+
+    property <duration> started;
+    property <float> target;
+    property <float> from: 0.0;
+
+    // Prevent reactivity
+    init => {
+        if is-play {
+            target = 1.0;
+            self.fill = Colors.green;
+        } else {
+            self.fill = Colors.red;
+        }
+    }
+
+    changed is-play => {
+        from = playing();
+        started = animation-tick();
+        if is-play {
+            target = 1.0;
+            self.fill = Colors.green;
+        } else {
+            target = 0.0;
+            self.fill = Colors.red;
+        }
+    }
+
+    pure function easeOutQuad(x: float) -> float {
+        return 1 - (1 - x) * (1 - x);
+    }
+
+    function playing() -> float {
+        let diff = target - from;
+        let progress = (animation-tick() - started) / duration;
+        return from + easeOutQuad(min(1.0, progress)) * diff;
+    }
+
+    viewbox-width: 3;
+    viewbox-height: 3;
+
+    animate fill {
+        duration: root.duration;
+        easing: ease-out-quad;
+    }
+
+    MoveTo {
+        x: 0;
+        y: 0;
+    }
+
+    LineTo {
+        x: 1 + playing() * 2;
+        y: 0 + playing() * 1.5;
+    }
+
+    LineTo {
+        x: 1 + playing() * 2;
+        y: 3 - playing() * 1.5;
+    }
+
+    LineTo {
+        x: 0;
+        y: 3;
+    }
+
+    Close { }
+
+    MoveTo {
+        x: 2 - playing() * 2;
+        y: 0 + playing() * 0.5;
+    }
+
+    LineTo {
+        x: 3;
+        y: 0 + playing() * 1.5;
+    }
+
+    LineTo {
+        x: 3;
+        y: 3 - playing() * 1.5;
+    }
+
+    LineTo {
+        x: 2 - playing() * 2;
+        y: 3 - playing() * 0.5;
+    }
+
+    Close { }
+}
+
+export component RefreshIcon inherits Rectangle {
+    in property <brush> stroke: white;
+
+    Path {
+        stroke: root.stroke;
+        stroke-width: 2px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4";
+    }
+
+    Path {
+        stroke: root.stroke;
+        stroke-width: 2px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4";
+    }
+}

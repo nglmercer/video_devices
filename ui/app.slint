@@ -1,84 +1,82 @@
-import { ConfigView } from "config.slint";
-import { WebcamView } from "webcam.slint";
+import {
+    Button,
+    ComboBox,
+    VerticalBox,
+    HorizontalBox,
+    Switch,
+} from "std-widgets.slint";
+import { ControlBar } from "control.slint";
+import { PauseIcon } from "icons.slint";
+
+import { CameraInfo, StatusState, CameraManager } from "globals.slint";
+import { CameraView } from "camera_view.slint";
+
+export { CameraInfo, StatusState, CameraManager }
 
 export component App inherits Window {
-    title: "Camera Application";
-    width: 900px;
-    height: 700px;
-    
-    // Callbacks for Rust integration
-    callback refresh-cameras();
-    callback get-camera-capabilities();
-    callback save-config();
-    callback start-camera();
-    callback stop-camera();
+    title: "Camera";
+    preferred-width: 800px;
+    preferred-height: 800px;
+
+    background: #121212;
+
+    callback refresh-cameras <=> control.refresh-cameras;
+    callback start-camera <=> control.start-camera;
+    callback stop-camera <=> control.stop-camera;
+
     callback update-frame();
-    
-    // Properties from Rust
-    in-out property <[string]> cameras: [];
-    in-out property <[string]> resolutions: [];
-    in-out property <[string]> fps-options: [];
-    in-out property <int> selected-camera-index: 0;
-    in-out property <int> selected-resolution-index: 0;
-    in-out property <int> selected-fps-index: 0;
-    in-out property <string> status-text: "Ready";
-    in-out property <bool> auto-detect: true;
-    in-out property <bool> is-loading: false;
-    in-out property <image> camera-frame;
-    in-out property <bool> camera-active: false;
-    in-out property <bool> is-streaming: false;
-    in-out property <int> fps: 0;
-    in-out property <string> camera-name: "No Camera";
-    in-out property <string> resolution-info: "Unknown";
-    in-out property <string> fps-info: "0 FPS";
-    
-    // View state
-    in-out property <string> current-view: "config"; // "config" or "webcam"
-    
-    // Main content area
-    if (current-view == "config") : ConfigView {
-        // Forward callbacks to Rust
-        refresh-cameras => { root.refresh-cameras(); }
-        get-camera-capabilities => { root.get-camera-capabilities(); }
-        save-config => { root.save-config(); }
-        start-webcam-view => {
-            root.current-view = "webcam";
-            root.start-camera();
-        }
-        
-        // Forward properties
-        cameras <=> root.cameras;
-        resolutions <=> root.resolutions;
-        fps-options <=> root.fps-options;
-        selected-camera-index <=> root.selected-camera-index;
-        selected-resolution-index <=> root.selected-resolution-index;
-        selected-fps-index <=> root.selected-fps-index;
-        status-text <=> root.status-text;
-        auto-detect <=> root.auto-detect;
-        is-loading <=> root.is-loading;
+
+    // See definition comment on `control.slint`
+    public function refresh-pause-icon() {
+        control.refresh-pause-icon();
     }
-    
-    if (current-view == "webcam") : WebcamView {
-        // Forward callbacks to Rust
-        start-camera => { root.start-camera(); }
-        stop-camera => { 
-            root.stop-camera();
-            root.current-view = "config";
+
+    // Properties from Rust
+    in-out property <string> status-text: "Ready";
+    in-out property <StatusState> status-state: StatusState.normal;
+
+    Timer {
+        interval: 1s / 60;
+        running: CameraManager.is-camera-active;
+        triggered => {
+            root.update-frame();
         }
-        update-frame => { root.update-frame(); }
-        back-to-config => {
-            root.stop-camera();
-            root.current-view = "config";
+    }
+
+    VerticalBox {
+        spacing: 10px;
+        padding: 10px;
+
+        control := ControlBar { }
+
+        CameraView { }
+
+        // Status bar
+        Rectangle {
+            height: 30px;
+            background: #222;
+            border-radius: 3px;
+
+            HorizontalLayout {
+                padding: 5px;
+
+                Text {
+                    text: status-text;
+                    color: {
+                        if status-state == StatusState.normal {
+                            #999
+                        } else if status-state == StatusState.error {
+                            #f00
+                        } else if status-state == StatusState.success {
+                            #0f0
+                        } else {
+                            #999
+                        }
+                    };
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
         }
-        
-        // Forward properties
-        camera-frame <=> root.camera-frame;
-        camera-active <=> root.camera-active;
-        status-text <=> root.status-text;
-        is-streaming <=> root.is-streaming;
-        fps <=> root.fps;
-        camera-name <=> root.camera-name;
-        resolution-info <=> root.resolution-info;
-        fps-info <=> root.fps-info;
     }
 }

@@ -1,3 +1,3 @@
 fn main() {
-    slint_build::compile("ui/camera_view.slint").unwrap();
+    slint_build::compile("ui/app.slint").unwrap();
 }
