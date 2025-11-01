@@ -3,6 +3,19 @@ name = "rust_video_devices"
 version = "0.1.0"
 edition = "2021"
 description = "Sistema simplificado de cámaras usando Nokhwa"
+build = "build.rs"
+
+# Optimizaciones de rendimiento para release
+[profile.release]
+lto = true              # Link Time Optimization
+codegen-units = 1       # Mejor optimización
+panic = "abort"         # Reduce tamaño binario
+strip = true            # Elimina símbolos de depuración
+opt-level = 3           # Máxima optimización
+
+[profile.dev]
+opt-level = 1           # Optimizaciones básicas en debug
+debug = true
 
 [dependencies]
 # Core dependencies
@@ -12,7 +25,7 @@ anyhow = "1.0"
 slint = "1.14"
 
 # Nokhwa para manejo de cámaras (única dependencia principal)
-nokhwa = { version = "0.10", features = ["input-native"] }
+nokhwa = { version = "0.10.0", features = ["input-native"] }
 
 # Image processing for camera frames
 image = "0.24"

@@ -1,5 +1,5 @@
 //! Buffer pooling para reducir allocaciones de memoria en procesamiento de video
-//! 
+//!
 //! Este módulo implementa pools de buffers reutilizables para:
 //! - Frames RGBA procesados
 //! - Datos temporales de conversión
@@ -25,7 +25,9 @@ impl SimpleBufferPool {
             max_buffers,
         }
     }
-    
+
+
+
     /// Obtiene un buffer del pool o crea uno nuevo
     pub fn get_buffer(&self) -> Vec<u8> {
         let mut buffers = self.buffers.lock();
@@ -37,16 +39,20 @@ impl SimpleBufferPool {
             Vec::with_capacity(self.buffer_size)
         }
     }
-    
+
     /// Devuelve un buffer al pool
     pub fn return_buffer(&self, mut buffer: Vec<u8>) {
         let mut buffers = self.buffers.lock();
         if buffers.len() < self.max_buffers {
             buffer.clear();
+            // Shrink para liberar memoria si es necesario
+            if buffer.capacity() > self.buffer_size * 2 {
+                buffer.shrink_to_fit();
+            }
             buffers.push(buffer);
         }
     }
-    
+
     /// Obtiene el tamaño del buffer
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
@@ -66,24 +72,24 @@ impl RgbaBufferPool {
     /// Crea un nuevo pool para buffers del tamaño especificado
     pub fn new(width: u32, height: u32, pool_size: usize) -> Self {
         let buffer_size = (width * height * 4) as usize;
-        
+
         Self {
             pool: SimpleBufferPool::new(buffer_size, pool_size),
             width,
             height,
         }
     }
-    
+
     /// Obtiene un buffer del pool
     pub fn get_buffer(&self) -> Vec<u8> {
         self.pool.get_buffer()
     }
-    
+
     /// Devuelve un buffer al pool
     pub fn return_buffer(&self, buffer: Vec<u8>) {
         self.pool.return_buffer(buffer);
     }
-    
+
     /// Obtiene el tamaño del buffer
     pub fn buffer_size(&self) -> usize {
         self.pool.buffer_size()
@@ -106,25 +112,25 @@ impl TempBufferPool {
             max_size,
         }
     }
-    
+
     /// Obtiene un buffer del pool
     #[allow(dead_code)] // Mantenido para API completa
     pub fn get_buffer(&self) -> Vec<u8> {
         self.pool.get_buffer()
     }
-    
+
     /// Obtiene un buffer del pool con tamaño específico (si es menor al máximo)
     #[allow(dead_code)] // Mantenido para API completa
     pub fn get_sized_buffer(&self, size: usize) -> Result<Vec<u8>> {
         if size > self.max_size {
             return Err(anyhow::anyhow!("Requested buffer size {} exceeds maximum {}", size, self.max_size));
         }
-        
+
         let mut buffer = self.pool.get_buffer();
         buffer.resize(size, 0);
         Ok(buffer)
     }
-    
+
     /// Devuelve un buffer al pool
     #[allow(dead_code)] // Mantenido para API completa
     pub fn return_buffer(&self, buffer: Vec<u8>) {
@@ -144,26 +150,26 @@ impl BufferPoolManager {
     pub fn new() -> Self {
         Self {
             rgba_pools: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            temp_pool: Arc::new(TempBufferPool::new(1920 * 1080 * 4, 10)), // Máximo 1080p RGBA
+            temp_pool: Arc::new(TempBufferPool::new(1920 * 1080 * 4, 5)), // Reducido a 5 buffers
         }
     }
-    
+
     /// Obtiene o crea un pool RGBA para el tamaño especificado
     pub fn get_rgba_pool(&self, width: u32, height: u32) -> Arc<RgbaBufferPool> {
         let mut pools = self.rgba_pools.lock();
-        
-        // Para resoluciones altas, usar más buffers para mejor rendimiento
+
+        // Optimización: usar menos buffers para reducir uso de memoria
         let pool_size = if width * height > 1280 * 720 {
-            10 // Más buffers para resoluciones altas
+            6 // Menos buffers para resoluciones altas
         } else {
-            5 // Buffer estándar para resoluciones normales
+            3 // Buffer reducido para resoluciones normales
         };
-        
+
         pools.entry((width, height))
             .or_insert_with(|| Arc::new(RgbaBufferPool::new(width, height, pool_size)))
             .clone()
     }
-    
+
     /// Obtiene el pool de buffers temporales
     #[allow(dead_code)] // Mantenido para API completa
     pub fn get_temp_pool(&self) -> Arc<TempBufferPool> {
@@ -189,59 +195,59 @@ pub fn get_buffer_pool_manager() -> &'static BufferPoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_simple_buffer_pool() {
         let pool = SimpleBufferPool::new(1024, 3);
-        
+
         // Obtener un buffer
         let buffer = pool.get_buffer();
         assert_eq!(buffer.capacity(), 1024);
-        
+
         // Devolver el buffer
         pool.return_buffer(buffer);
     }
-    
+
     #[test]
     fn test_rgba_buffer_pool() {
         let pool = RgbaBufferPool::new(640, 480, 3);
-        
+
         // Obtener un buffer
         let buffer = pool.get_buffer();
         assert_eq!(buffer.capacity(), 640 * 480 * 4);
-        
+
         // Devolver el buffer
         pool.return_buffer(buffer);
     }
-    
+
     #[test]
     fn test_temp_buffer_pool() {
         let pool = TempBufferPool::new(1024, 3);
-        
+
         // Obtener un buffer
         let buffer = pool.get_buffer();
         assert_eq!(buffer.capacity(), 1024);
-        
+
         // Obtener un buffer con tamaño específico
         let sized_buffer = pool.get_sized_buffer(512).unwrap();
         assert_eq!(sized_buffer.len(), 512);
-        
+
         // Devolver los buffers
         pool.return_buffer(buffer);
         pool.return_buffer(sized_buffer);
     }
-    
+
     #[test]
     fn test_buffer_pool_manager() {
         let manager = BufferPoolManager::new();
-        
+
         // Obtener pool RGBA
         let pool1 = manager.get_rgba_pool(640, 480);
         let pool2 = manager.get_rgba_pool(640, 480);
-        
+
         // Debería ser el mismo pool (mismo tamaño)
         assert!(Arc::ptr_eq(&pool1, &pool2));
-        
+
         // Obtener pool con diferente tamaño
         let pool3 = manager.get_rgba_pool(1280, 720);
         assert!(!Arc::ptr_eq(&pool1, &pool3));
