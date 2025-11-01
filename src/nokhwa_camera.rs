@@ -7,12 +7,12 @@
 
 use anyhow::{Result, anyhow};
 use std::panic;
-use parking_lot::Mutex;
+// Mutex eliminado - no se utiliza
 
 // Importaciones específicas para Nokhwa 0.10.0
 use nokhwa::{
     utils::{
-        CameraInfo as NokhwaCameraInfo,
+// CameraInfo eliminado - no se utiliza
         RequestedFormat,
         RequestedFormatType,
         ApiBackend,
@@ -25,7 +25,8 @@ use nokhwa::{
 pub enum CameraAccessibility {
     /// Cámara completamente accesible
     Accessible { api_backend: String },
-    /// Cámara no accesible
+    /// Cámara no accesible (no utilizado)
+    #[allow(dead_code)]
     Inaccessible(String),
 }
 
@@ -77,7 +78,9 @@ pub enum ScanStrategy {
 pub struct CameraManagerConfig {
     pub strategy: ScanStrategy,
     pub max_cameras: usize,
+    #[allow(dead_code)] // Mantenido para compatibilidad futura
     pub preferred_fps: u32,
+    #[allow(dead_code)] // Mantenido para compatibilidad futura
     pub auto_select_best: bool,
 }
 
@@ -186,6 +189,7 @@ impl NokhwaCameraManager {
     }
 
     /// Obtiene cámaras accesibles
+    #[allow(dead_code)] // Mantenido para compatibilidad futura
     pub fn accessible_cameras(&self) -> Vec<&CameraInfo> {
         self.cameras.iter()
             .filter(|cam| cam.is_usable())

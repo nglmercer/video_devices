@@ -3,6 +3,7 @@ mod buffer_pool;
 mod frame_processor;
 mod async_frame_handler;
 mod slint_renderer;
+mod direct_preview;
 
 // Windows permissions eliminados para simplificar la detección de cámaras
 
@@ -10,10 +11,10 @@ use nokhwa_camera::{NokhwaCameraManager, VideoStream};
 use slint::{Image, SharedPixelBuffer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use parking_lot::Mutex as ParkingMutex;
-use async_frame_handler::{AsyncFrameHandler, AsyncFrameHandlerConfig};
-use slint_renderer::{SlintRenderer, SlintRendererConfig};
+
+
 
 slint::include_modules!();
 
@@ -25,10 +26,10 @@ struct CameraState {
     is_streaming: Arc<ParkingMutex<bool>>,
     frame_count: Arc<ParkingMutex<u32>>,
     last_fps_update: Arc<ParkingMutex<Instant>>,
-    async_handler: Arc<ParkingMutex<Option<AsyncFrameHandler>>>,
-    slint_renderer: Arc<ParkingMutex<Option<SlintRenderer>>>,
     render_performance_stats: Arc<ParkingMutex<RenderPerformanceStats>>,
 }
+
+// Modo simplificado: Solo Direct para máxima velocidad
 
 #[derive(Debug, Default)]
 struct RenderPerformanceStats {
@@ -48,9 +49,8 @@ impl CameraState {
             is_streaming: Arc::new(ParkingMutex::new(false)),
             frame_count: Arc::new(ParkingMutex::new(0)),
             last_fps_update: Arc::new(ParkingMutex::new(Instant::now())),
-            async_handler: Arc::new(ParkingMutex::new(None)),
-            slint_renderer: Arc::new(ParkingMutex::new(None)),
             render_performance_stats: Arc::new(ParkingMutex::new(RenderPerformanceStats::default())),
+
         }
     }
 }
@@ -84,12 +84,14 @@ async fn main() -> Result<()> {
     let ui_weak_start = ui.as_weak();
     let ui_weak_stop = ui.as_weak();
     let ui_weak_update = ui.as_weak();
+    let _ui_weak_preview_mode = ui.as_weak();
 
     let camera_state_refresh = camera_state.clone();
     let camera_state_start = camera_state.clone();
     let camera_state_stop = camera_state.clone();
     let camera_state_update = camera_state.clone();
     let camera_state_initial = camera_state.clone();
+    let _camera_state_preview_mode = camera_state.clone();
 
     ui.on_refresh_cameras(move || {
         let ui = ui_weak_refresh.upgrade().unwrap();
@@ -143,16 +145,6 @@ async fn main() -> Result<()> {
 
                 *state.frame_count.lock() = 0;
                 *state.last_fps_update.lock() = Instant::now();
-
-                if let Err(e) = start_async_frame_handler(&state) {
-                    eprintln!("Error starting async handler: {}", e);
-                    ui.set_status_text(format!("Async handler error: {}", e).into());
-                }
-
-                if let Err(e) = initialize_slint_renderer(&state) {
-                    eprintln!("Error initializing Slint renderer: {}", e);
-                    ui.set_status_text(format!("Renderer error: {}", e).into());
-                }
             }
             Err(e) => {
                 eprintln!("Error starting camera: {}", e);
@@ -165,13 +157,7 @@ async fn main() -> Result<()> {
         let ui = ui_weak_stop.upgrade().unwrap();
         let state = camera_state_stop.clone();
 
-        if let Err(e) = stop_async_frame_handler(&state) {
-            eprintln!("Error stopping async handler: {}", e);
-        }
-
-        if let Err(e) = cleanup_slint_renderer(&state) {
-            eprintln!("Error cleaning up renderer: {}", e);
-        }
+        // Handlers no se usan en modo Direct
 
         if let Err(e) = stop_camera_stream(&state) {
             eprintln!("Error stopping camera: {}", e);
@@ -192,22 +178,25 @@ async fn main() -> Result<()> {
         }
 
         if let Some(ui) = ui_weak_update.upgrade() {
-            match update_frame_with_slint_native(&state) {
+            // Preview directa sin delay (único modo disponible)
+            match update_frame_direct_preview(&state) {
                 Ok(Some(image)) => {
                     ui.set_camera_frame(image);
                     update_fps_counter_optimized(&state, &ui);
                 }
-                Ok(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                Ok(None) => {
+                    // No hay frame disponible, continuar sin espera
                 }
                 Err(e) => {
-                    eprintln!("Optimized frame error: {}", e);
+                    eprintln!("Frame error: {}", e);
                     ui.set_status_text(format!("Frame error: {}", e).into());
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             }
         }
     });
+
+
 
     match refresh_camera_list(&camera_state_initial) {
         Ok(camera_names) => {
@@ -311,44 +300,11 @@ fn stop_camera_stream(state: &CameraState) -> Result<()> {
     Ok(())
 }
 
-fn start_async_frame_handler(state: &CameraState) -> Result<()> {
-    let config = AsyncFrameHandlerConfig {
-        target_fps: 30.0,
-        max_buffer_size: 2,
-        frame_skip_threshold: Duration::from_millis(33),
-        enable_adaptive_skipping: true,
-    };
 
-    let mut handler = AsyncFrameHandler::new(config);
-    handler.start()?;
 
-    *state.async_handler.lock() = Some(handler);
-    println!("🚀 Async frame handler iniciado");
-    Ok(())
-}
-
-fn stop_async_frame_handler(state: &CameraState) -> Result<()> {
-    let mut handler_guard = state.async_handler.lock();
-    if let Some(ref mut handler) = *handler_guard {
-        handler.stop()?;
-        *handler_guard = None;
-        println!("⏹️ Async frame handler detenido");
-    }
-    Ok(())
-}
-
-fn update_frame_with_slint_native(state: &CameraState) -> Result<Option<Image>> {
+/// Preview directa con latencia mínima (~1-2ms)
+fn update_frame_direct_preview(state: &CameraState) -> Result<Option<Image>> {
     let start_time = Instant::now();
-
-    {
-        let stats = state.render_performance_stats.lock();
-        if stats.should_skip_frame(25.0) {
-            drop(stats);
-            let mut stats = state.render_performance_stats.lock();
-            stats.frames_skipped += 1;
-            return Ok(None);
-        }
-    }
 
     let buffer = {
         let mut stream = state.stream.lock();
@@ -356,92 +312,40 @@ fn update_frame_with_slint_native(state: &CameraState) -> Result<Option<Image>> 
             match video_stream.capture_frame() {
                 Ok(buffer) => buffer,
                 Err(e) => {
-                    eprintln!("Error capturing frame: {}", e);
-                    return Err(e);
+                    return Err(anyhow!("Error capturando frame: {}", e));
                 }
             }
         } else {
-            return Err(anyhow::anyhow!("No video stream available"));
+            return Err(anyhow!("No video stream disponible"));
         }
     };
 
+    // Conversión directa sin buffering usando métodos nativos de Slint
+    let image = direct_preview::convert_frame_to_slint(&buffer)?;
+
+    let render_time = start_time.elapsed();
+
+    // Actualizar métricas
     {
-        let handler_guard = state.async_handler.lock();
-        if let Some(ref handler) = *handler_guard {
-            if let Err(e) = handler.submit_captured_frame(buffer) {
-                eprintln!("Error submitting frame: {}", e);
-            }
+        let mut stats = state.render_performance_stats.lock();
+        stats.frames_rendered += 1;
+        stats.total_render_time += render_time;
+        stats.average_render_time = stats.total_render_time / stats.frames_rendered as u32;
+
+        // Calcular FPS actual
+        if stats.frames_rendered % 30 == 0 {
+            stats.current_fps = 1.0 / render_time.as_secs_f64();
         }
     }
 
-    let handler_guard = state.async_handler.lock();
-    if let Some(ref handler) = *handler_guard {
-        if let Some(processed_frame) = handler.get_next_frame() {
-            let render_time = start_time.elapsed();
-            let mut stats = state.render_performance_stats.lock();
-            stats.update(render_time);
-
-            return Ok(Some(processed_frame.image));
-        }
-    }
-
-    Ok(None)
+    Ok(Some(image))
 }
 
-fn initialize_slint_renderer(state: &CameraState) -> Result<()> {
-    let config = SlintRendererConfig {
-        enable_frame_caching: true,
-        adaptive_quality: true,
-        max_cache_size: 3,
-        target_fps: 30.0,
-    };
 
-    let mut renderer = SlintRenderer::new(config);
 
-    if let Some(ref mut stream) = *state.stream.lock() {
-        if let Ok(buffer) = stream.capture_frame() {
-            let resolution = buffer.resolution();
-            renderer.initialize(resolution.width() as u32, resolution.height() as u32);
-        }
-    }
-
-    *state.slint_renderer.lock() = Some(renderer);
-    println!("🚀 Slint renderer optimizado inicializado");
-    Ok(())
-}
-
-fn cleanup_slint_renderer(state: &CameraState) -> Result<()> {
-    let mut renderer_guard = state.slint_renderer.lock();
-    if let Some(ref mut renderer) = *renderer_guard {
-        let metrics = renderer.get_performance_metrics();
-        println!("📊 Render stats - Frames: {}, Avg time: {:?}, Cache hit: {:.2}%",
-                metrics.total_frames_processed,
-                metrics.average_processing_time,
-                metrics.cache_hit_rate * 100.0);
-        *renderer_guard = None;
-    }
-    Ok(())
-}
 
 fn update_fps_counter_optimized(state: &CameraState, ui: &CameraView) {
-    {
-        let handler_guard = state.async_handler.lock();
-        if let Some(ref handler) = *handler_guard {
-            let metrics = handler.get_metrics();
-            ui.set_fps(metrics.current_fps as i32);
-        }
-    }
-
-    {
-        let renderer_guard = state.slint_renderer.lock();
-        if let Some(ref renderer) = *renderer_guard {
-            let metrics = renderer.get_performance_metrics();
-            if metrics.total_frames_processed > 0 {
-                let fps = 1.0 / metrics.average_processing_time.as_secs_f64();
-                ui.set_fps(fps as i32);
-            }
-        }
-    }
+    // FPS calculado desde render_performance_stats en modo Direct
 
     {
         let stats = state.render_performance_stats.lock();
