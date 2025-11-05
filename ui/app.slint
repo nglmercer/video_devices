@@ -24,30 +24,17 @@ export component App inherits Window {
     callback start-camera <=> control.start-camera;
     callback stop-camera <=> control.stop-camera;
 
-    callback update-frame();
-
-    // See definition comment on `control.slint`
-    public function refresh-pause-icon() {
-        control.refresh-pause-icon();
-    }
-
     // Properties from Rust
-    in-out property <string> status-text: "Ready";
-    in-out property <StatusState> status-state: StatusState.normal;
-
-    Timer {
-        interval: 1s / 60;
-        running: CameraManager.is-camera-active;
-        triggered => {
-            root.update-frame();
-        }
-    }
+    in property <string> status-text: "Ready";
+    in property <StatusState> status-state: StatusState.normal;
 
     VerticalBox {
         spacing: 10px;
         padding: 10px;
 
-        control := ControlBar { }
+        control := ControlBar {
+            z: 1;
+        }
 
         CameraView { }
 

@@ -1,11 +1,11 @@
 import { CameraManager } from "globals.slint";
 export component CameraView inherits Rectangle {
-    background: #333333;
+    background: #333;
     border-width: 2px;
     border-color: #666;
     min-height: 400px;
 
-    if (CameraManager.is-camera-active): Image {
+    if (CameraManager.is-streaming): Image {
         source: CameraManager.camera-frame;
         image-fit: contain;
         width: 100%;

@@ -10,20 +10,8 @@ export component ControlBar inherits Rectangle {
     callback stop-camera();
     callback start-camera();
 
-    // When camera is starting up, it takes a lot of cpu time that prevents 
-    // pause icon beign updated correctly, so should delayed UI to a good
-    // looking animations, this needs to have a way to tell pause icon that
-    // the thread is not busy anymore
-    public function refresh-pause-icon() {
-        paused.is-play = !CameraManager.is-camera-active;
-    }
-
-    init => {
-        paused.is-play = !CameraManager.is-camera-active;
-    }
-
     Rectangle {
-        background: rgba(0, 0, 0, 0.8);
+        background: black.with-alpha(80%);
         border-radius: 4px;
         border-width: 1px;
         border-color: #333;
@@ -34,6 +22,7 @@ export component ControlBar inherits Rectangle {
             height: 30px;
 
             paused := PauseIcon {
+                is-play: !CameraManager.is-streaming;
                 width: parent.width;
                 height: parent.height;
             }

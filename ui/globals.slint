@@ -10,7 +10,7 @@ export enum StatusState {
 }
 
 export global CameraManager {
-    in property <[CameraInfo]> cameras;
+    in property <[CameraInfo]> cameras: [{ name: "Camera 1" }, { name: "Cam" }, { name: "CAMERA 123456 12839123" }];
     in property <image> camera-frame;
     in property <int> fps;
     in property <bool> is-camera-active;

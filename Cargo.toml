@@ -25,7 +25,7 @@ anyhow = "1.0"
 slint = "1.14"
 
 # Nokhwa para manejo de cámaras (única dependencia principal)
-nokhwa = { version = "0.10.0", features = ["input-native"] }
+nokhwa = { version = "0.10.0", features = ["input-native", "output-threaded"] }
 
 # Image processing for camera frames
 image = "0.24"

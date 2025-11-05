@@ -8,7 +8,7 @@ use nokhwa::utils::{ApiBackend, CameraInfo};
 use slint::{ComponentHandle, VecModel};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::nokhwa_camera::CameraIndex;
 
@@ -28,6 +28,7 @@ pub enum StatusState {
     Success(String),
 }
 
+#[derive(Clone)]
 struct AppWeak {
     state: Weak<AppState>,
     window: slint::Weak<ui::App>,
@@ -44,7 +45,7 @@ impl AppWeak {
 
 struct AppState {
     cameras: RefCell<Vec<CameraInfo>>,
-    current_camera: RefCell<Option<nokhwa::Camera>>,
+    current_camera: RefCell<Option<nokhwa_camera::CameraAbort>>,
 }
 
 struct App {
@@ -130,31 +131,6 @@ impl App {
         self.set_status(StatusState::Normal(format!("Found {count} cameras")));
     }
 
-    fn get_camera_frame(&self) -> Result<()> {
-        let Some(ref mut camera) = *self.state.current_camera.borrow_mut() else {
-            return Ok(());
-        };
-
-        let start_time = Instant::now();
-
-        let buffer = camera
-            .frame()
-            .map_err(|e| anyhow!("Capturing frame: {e}"))?;
-
-        let image = slint_renderer::render_frame(&buffer)?;
-
-        let render_time = start_time.elapsed();
-        let fps = 1.0 / render_time.as_secs_f64();
-
-        self.camera_manager().set_camera_frame(image);
-
-        if fps > 0.0 {
-            self.camera_manager().set_fps(fps.trunc() as i32);
-        }
-
-        Ok(())
-    }
-
     pub fn run(self) -> Result<()> {
         self.window.on_refresh_cameras({
             let app = self.as_weak();
@@ -182,14 +158,48 @@ impl App {
 
                 println!("🎥 Starting camera...");
 
-                match nokhwa_camera::create_camera_stream(camera.index().clone()) {
-                    Ok(camera_stream) => {
+                match nokhwa_camera::create_camera(camera.index().clone()) {
+                    Ok(camera) => {
                         println!("✅ Camera started successfully");
-
-                        *app.state.current_camera.borrow_mut() = Some(camera_stream);
 
                         app.set_status(StatusState::Normal("Camera started successfully".into()));
                         app.camera_manager().set_is_camera_active(true);
+
+                        let window = app.as_weak().window;
+                        let camera_stream = nokhwa_camera::create_camera_stream(
+                            camera,
+                            move |result| match result {
+                                Ok((frame, fps)) => {
+                                    _ = window.upgrade_in_event_loop(move |w| {
+                                        let image = slint::Image::from_rgba8(frame);
+                                        let manager = w.global::<ui::CameraManager>();
+
+                                        // Ignore frames that comes after camera stops
+                                        if !manager.get_is_camera_active() {
+                                            return;
+                                        }
+
+                                        manager.set_camera_frame(image);
+                                        manager.set_fps(fps.trunc() as i32);
+
+                                        // Streaming means there's at least one frame
+                                        if !manager.get_is_streaming() {
+                                            manager.set_is_streaming(true);
+                                            // w.invoke_refresh_pause_icon()
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("Frame error: {e}");
+                                    _ = window.upgrade_in_event_loop(move |w| {
+                                        w.set_status_text(format!("Error: {e}").into());
+                                        w.set_status_state(ui::StatusState::Error)
+                                    });
+                                }
+                            },
+                        );
+
+                        *app.state.current_camera.borrow_mut() = Some(camera_stream);
                     }
                     Err(e) => {
                         eprintln!("❌ Error creating camera stream: {e}");
@@ -205,36 +215,16 @@ impl App {
             move || {
                 let app = app.upgrade().unwrap();
 
-                *app.state.current_camera.borrow_mut() = None;
+                app.state
+                    .current_camera
+                    .borrow_mut()
+                    .take()
+                    .map(nokhwa_camera::CameraAbort::abort);
 
                 app.camera_manager().set_is_camera_active(false);
                 app.camera_manager().set_is_streaming(false);
                 app.set_status(StatusState::Normal("Camera stopped".into()));
-                app.window.invoke_refresh_pause_icon();
-            }
-        });
-
-        self.window.on_update_frame({
-            let app = self.as_weak();
-            move || {
-                let app = app.upgrade().unwrap();
-                if !app.camera_manager().get_is_streaming() {
-                    app.camera_manager().set_is_streaming(true);
-
-                    let window = app.as_weak().window.clone();
-
-                    std::thread::spawn(move || {
-                        // Arbitraty value to wait camera framerate and busy thread to stabilize
-                        // see more in `control.slint`
-                        std::thread::sleep(Duration::from_millis(500));
-                        window.upgrade_in_event_loop(|w| w.invoke_refresh_pause_icon())
-                    });
-                }
-
-                if let Err(e) = app.get_camera_frame() {
-                    eprintln!("Frame error: {e}");
-                    app.set_error_status(&e);
-                }
+                // app.window.invoke_refresh_pause_icon();
             }
         });
 
