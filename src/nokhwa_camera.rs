@@ -88,11 +88,49 @@ where
     let abort = Arc::new(AtomicBool::new(false));
     let camera_abort = CameraAbort(abort.clone());
 
-    std::thread::spawn(move || loop {
-        callback(camera_frame(&mut camera));
+    std::thread::spawn(move || {
+        let mut frame_times: Vec<f64> = Vec::with_capacity(60);
+        let mut last_fps_update = Instant::now();
+        let mut cached_fps = 0.0;
+        
+        loop {
+            let frame_start = Instant::now();
+            let result = camera_frame(&mut camera);
+            
+            match &result {
+                Ok((_, fps)) => {
+                    frame_times.push(1.0 / fps);
+                    if frame_times.len() > 60 {
+                        frame_times.remove(0);
+                    }
+                }
+                Err(_) => frame_times.clear(),
+            }
+            
+            // Calcular FPS promedio solo cada segundo para reducir overhead
+            let now = Instant::now();
+            if now.duration_since(last_fps_update).as_secs() >= 1 {
+                cached_fps = if frame_times.is_empty() {
+                    0.0
+                } else {
+                    frame_times.len() as f64 / frame_times.iter().sum::<f64>()
+                };
+                last_fps_update = now;
+            }
+            
+            callback(result.map(|(frame, _)| (frame, cached_fps)));
 
-        if abort.load(Ordering::Relaxed) {
-            break;
+            if abort.load(Ordering::Relaxed) {
+                break;
+            }
+            
+            // Throttling: dormir brevemente para reducir uso de CPU
+            // Esto permite que el hilo no consuma 100% CPU cuando la cámara
+            // no puede mantener altos framerates
+            let elapsed = frame_start.elapsed();
+            if elapsed.as_millis() < 16 { // Aprox 60 FPS max
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
     });
 

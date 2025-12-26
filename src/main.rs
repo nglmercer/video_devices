@@ -7,6 +7,7 @@ use nokhwa::utils::{ApiBackend, CameraInfo};
 use slint::{ComponentHandle, VecModel};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
+use std::time::Instant;
 
 use crate::nokhwa_camera::CameraIndex;
 
@@ -183,6 +184,7 @@ impl App {
                             camera,
                             move |result| match result {
                                 Ok((frame, fps)) => {
+                                    // Batch de actualizaciones de UI para reducir overhead
                                     _ = window.upgrade_in_event_loop(move |w| {
                                         let image = slint::Image::from_rgba8(frame);
                                         let manager = w.global::<ui::CameraManager>();
@@ -192,24 +194,30 @@ impl App {
                                             return;
                                         }
 
+                                        // Actualizar frame y FPS en una sola llamada
                                         manager.set_camera_frame(image);
                                         manager.set_fps(fps.round() as i32);
 
                                         // Streaming means there's at least one frame
                                         if !manager.get_is_streaming() {
                                             manager.set_is_streaming(true);
-                                            // w.invoke_refresh_pause_icon()
                                         }
                                     });
                                 }
                                 Err(e) => {
                                     use std::sync::atomic::{AtomicUsize, Ordering};
                                     static ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
+                                    static LAST_ERROR_TIME: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
                                     
                                     let count = ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                                     
-                                    // Only show errors every 10 frames to avoid spam
-                                    if count % 10 == 0 {
+                                    // Solo mostrar errores cada 2 segundos para reducir overhead
+                                    let last_error_time = LAST_ERROR_TIME.get_or_init(|| std::sync::Mutex::new(Instant::now()));
+                                    let mut last_time = last_error_time.lock().unwrap();
+                                    let now = Instant::now();
+                                    
+                                    if now.duration_since(*last_time).as_secs() >= 2 {
+                                        *last_time = now;
                                         eprintln!("Frame error #{count}: {e}");
                                         _ = window.upgrade_in_event_loop(move |w| {
                                             w.set_status_text(format!("Error (#{count}): {e}").into());
