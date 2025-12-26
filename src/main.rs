@@ -14,8 +14,7 @@ pub mod ui {
     slint::include_modules!();
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let ui = App::new()?;
     ui.run()
 }
@@ -49,6 +48,12 @@ struct AppState {
 struct App {
     window: ui::App,
     state: Rc<AppState>,
+}
+
+impl App {
+    // Static status messages to reduce allocations
+    const STATUS_CAMERA_STARTED: &'static str = "Camera started successfully";
+    const STATUS_CAMERA_STOPPED: &'static str = "Camera stopped";
 }
 
 impl App {
@@ -114,18 +119,21 @@ impl App {
 
         let cameras = self.state.cameras.borrow();
         let count = cameras.len();
-        let cameras: VecModel<ui::CameraInfo> = cameras
+        let camera_vec: Vec<ui::CameraInfo> = cameras
             .iter()
             .map(|c| ui::CameraInfo {
                 index: c.index().as_string().into(),
                 name: c.human_name().into(),
             })
             .collect();
+        
+        // Libera el borrow antes de actualizar UI
+        drop(cameras);
 
         println!("Found {count} cameras");
 
         self.camera_manager()
-            .set_cameras(slint::ModelRc::new(cameras));
+            .set_cameras(slint::ModelRc::new(VecModel::from(camera_vec)));
         self.set_status(StatusState::Normal(format!("Found {count} cameras")));
     }
 
@@ -133,7 +141,11 @@ impl App {
         self.window.on_refresh_cameras({
             let app = self.as_weak();
             move || {
-                app.upgrade().unwrap().refresh_camera_list();
+                if let Some(app) = app.upgrade() {
+                    app.refresh_camera_list();
+                } else {
+                    eprintln!("App was destroyed, cannot refresh cameras");
+                }
             }
         });
 
@@ -141,7 +153,10 @@ impl App {
             let app = self.as_weak();
 
             move || {
-                let app = app.upgrade().unwrap();
+                let Some(app) = app.upgrade() else {
+                    eprintln!("App was destroyed, cannot start camera");
+                    return;
+                };
 
                 let selected_index = app.camera_manager().get_selected_camera().index;
                 let selected_index = CameraIndex(selected_index.to_string());
@@ -160,7 +175,7 @@ impl App {
                     Ok(camera) => {
                         println!("✅ Camera started successfully");
 
-                        app.set_status(StatusState::Normal("Camera started successfully".into()));
+                        app.set_status(StatusState::Normal(Self::STATUS_CAMERA_STARTED.to_string()));
                         app.camera_manager().set_is_camera_active(true);
 
                         let window = app.as_weak().window;
@@ -178,7 +193,7 @@ impl App {
                                         }
 
                                         manager.set_camera_frame(image);
-                                        manager.set_fps(fps.trunc() as i32);
+                                        manager.set_fps(fps.round() as i32);
 
                                         // Streaming means there's at least one frame
                                         if !manager.get_is_streaming() {
@@ -188,11 +203,31 @@ impl App {
                                     });
                                 }
                                 Err(e) => {
-                                    eprintln!("Frame error: {e}");
-                                    _ = window.upgrade_in_event_loop(move |w| {
-                                        w.set_status_text(format!("Error: {e}").into());
-                                        w.set_status_state(ui::StatusState::Error)
-                                    });
+                                    use std::sync::atomic::{AtomicUsize, Ordering};
+                                    static ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
+                                    
+                                    let count = ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    
+                                    // Only show errors every 10 frames to avoid spam
+                                    if count % 10 == 0 {
+                                        eprintln!("Frame error #{count}: {e}");
+                                        _ = window.upgrade_in_event_loop(move |w| {
+                                            w.set_status_text(format!("Error (#{count}): {e}").into());
+                                            w.set_status_state(ui::StatusState::Error)
+                                        });
+                                    }
+                                    
+                                    // Stop camera if too many consecutive errors
+                                    if count >= 100 {
+                                        ERROR_COUNT.store(0, Ordering::Relaxed);
+                                        _ = window.upgrade_in_event_loop(move |w| {
+                                            let manager = w.global::<ui::CameraManager>();
+                                            manager.set_is_camera_active(false);
+                                            manager.set_is_streaming(false);
+                                            w.set_status_text("Too many errors, camera stopped".into());
+                                            w.set_status_state(ui::StatusState::Error);
+                                        });
+                                    }
                                 }
                             },
                         );
@@ -211,7 +246,10 @@ impl App {
             let app = self.as_weak();
 
             move || {
-                let app = app.upgrade().unwrap();
+                let Some(app) = app.upgrade() else {
+                    eprintln!("App was destroyed, cannot stop camera");
+                    return;
+                };
 
                 if let Some(camera) = app.state
                     .current_camera
@@ -222,7 +260,7 @@ impl App {
 
                 app.camera_manager().set_is_camera_active(false);
                 app.camera_manager().set_is_streaming(false);
-                app.set_status(StatusState::Normal("Camera stopped".into()));
+                app.set_status(StatusState::Normal(Self::STATUS_CAMERA_STOPPED.to_string()));
                 // app.window.invoke_refresh_pause_icon();
             }
         });

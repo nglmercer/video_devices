@@ -91,7 +91,7 @@ where
     std::thread::spawn(move || loop {
         callback(camera_frame(&mut camera));
 
-        if abort.load(Ordering::SeqCst) {
+        if abort.load(Ordering::Relaxed) {
             break;
         }
     });

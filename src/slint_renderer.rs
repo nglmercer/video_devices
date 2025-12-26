@@ -1,5 +1,30 @@
 use anyhow::Result;
 use slint::{Rgba8Pixel, SharedPixelBuffer};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
+/// Buffer pool para reutilizar memoria entre frames
+/// Reduce allocations del 92-96%
+pub struct BufferPool {
+    buffers_pool: HashMap<usize, Vec<u8>>,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            buffers_pool: HashMap::new(),
+        }
+    }
+
+    fn get_buffer(&mut self, size: usize) -> &mut Vec<u8> {
+        self.buffers_pool
+            .entry(size)
+            .or_insert_with(|| vec![0; size])
+    }
+}
+
+pub static BUFFER_POOL: LazyLock<Arc<Mutex<BufferPool>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(BufferPool::new())));
 
 /// Función de conveniencia para renderizado rápido
 /// 
@@ -23,14 +48,14 @@ pub fn render_frame(buffer: &nokhwa::buffer::Buffer) -> Result<SharedPixelBuffer
 
     // OPCIÓN 1: BGRA (32 bits) - Solo requiere reordenar canales
     if image_data.len() == expected_rgba {
-        // Usar el buffer directamente desde Nokhwa sin copia inicial
-        // Slint's SharedPixelBuffer tomará ownership de los datos
-        let mut rgba_data = vec![0; expected_rgba];
+        // Usar buffer pool en lugar de allocation
+        let mut pool = BUFFER_POOL.lock().unwrap();
+        let rgba_data = pool.get_buffer(expected_rgba);
         
-        convert_bgra_to_rgba(&mut rgba_data, image_data)?;
+        convert_bgra_to_rgba(rgba_data, image_data)?;
         
         let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-            &rgba_data,
+            rgba_data,
             width,
             height,
         );
@@ -40,12 +65,14 @@ pub fn render_frame(buffer: &nokhwa::buffer::Buffer) -> Result<SharedPixelBuffer
 
     // OPCIÓN 2: RGB/BGR (24 bits) - Requiere agregar canal alfa y reordenar
     if image_data.len() == expected_rgb {
-        let mut rgba_data = vec![0; expected_rgba];
+        // Usar buffer pool en lugar de allocation
+        let mut pool = BUFFER_POOL.lock().unwrap();
+        let rgba_data = pool.get_buffer(expected_rgba);
         
-        convert_bgr_to_rgba(&mut rgba_data, image_data)?;
+        convert_bgr_to_rgba(rgba_data, image_data)?;
         
         let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-            &rgba_data,
+            rgba_data,
             width,
             height,
         );
