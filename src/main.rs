@@ -1,4 +1,3 @@
-mod buffer_pool;
 mod nokhwa_camera;
 mod slint_renderer;
 
@@ -8,7 +7,6 @@ use nokhwa::utils::{ApiBackend, CameraInfo};
 use slint::{ComponentHandle, VecModel};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::time::Duration;
 
 use crate::nokhwa_camera::CameraIndex;
 
@@ -215,11 +213,12 @@ impl App {
             move || {
                 let app = app.upgrade().unwrap();
 
-                app.state
+                if let Some(camera) = app.state
                     .current_camera
                     .borrow_mut()
-                    .take()
-                    .map(nokhwa_camera::CameraAbort::abort);
+                    .take() {
+                    nokhwa_camera::CameraAbort::abort(camera);
+                }
 
                 app.camera_manager().set_is_camera_active(false);
                 app.camera_manager().set_is_streaming(false);

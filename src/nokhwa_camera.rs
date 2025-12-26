@@ -48,9 +48,10 @@ impl PartialEq<NokhwaIndex> for CameraIndex {
 pub fn create_camera(camera_index: NokhwaIndex) -> Result<nokhwa::Camera> {
     println!("🎥 Creando VideoStream para cámara {camera_index}...");
 
+    // Prioridad: RGBA primero (solo reordena canales), luego RGB (expande), finalmente YUYV
     let requested_formats = vec![
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution),
         RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestResolution),
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution),
         RequestedFormat::new::<YuyvFormat>(RequestedFormatType::AbsoluteHighestResolution),
     ];
 

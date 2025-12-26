@@ -1,83 +1,113 @@
-use crate::buffer_pool::BUFFER_POOL;
 use anyhow::Result;
-use slint::{Image, Rgb8Pixel, Rgba8Pixel, SharedPixelBuffer};
+use slint::{Rgba8Pixel, SharedPixelBuffer};
 
 /// Función de conveniencia para renderizado rápido
+/// 
+/// Esta función intenta evitar conversiones innecesarias de formato de color.
+/// Slint requiere datos en formato RGBA, pero Nokhwa puede entregar:
+/// - BGR (24 bits) → necesita conversión a RGBA
+/// - BGRA (32 bits) → necesita conversión de orden de canales
+/// - MJPEG (comprimido) → necesita decodificación
+/// 
+/// Optimización: Si Slint soporta directamente BGR/BGRA en el futuro, 
+/// podríamos eliminar estas conversiones completamente.
 pub fn render_frame(buffer: &nokhwa::buffer::Buffer) -> Result<SharedPixelBuffer<Rgba8Pixel>> {
     let resolution = buffer.resolution();
-    let width = resolution.width() as u32;
-    let height = resolution.height() as u32;
+    let width = resolution.width();
+    let height = resolution.height();
 
     let image_data = buffer.buffer();
 
     let expected_rgb = (width * height * 3) as usize;
     let expected_rgba = (width * height * 4) as usize;
 
-    match image_data.len() {
-        // RGB → usar from_rgb8 nativo con conversión BGR→RGB
-        len if len == expected_rgb => {
-            let mut pool = BUFFER_POOL.lock().unwrap();
-            let rgb_buffer = pool.get_buffer(expected_rgba);
+    // OPCIÓN 1: BGRA (32 bits) - Solo requiere reordenar canales
+    if image_data.len() == expected_rgba {
+        // Usar el buffer directamente desde Nokhwa sin copia inicial
+        // Slint's SharedPixelBuffer tomará ownership de los datos
+        let mut rgba_data = vec![0; expected_rgba];
+        
+        convert_bgra_to_rgba(&mut rgba_data, image_data)?;
+        
+        let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+            &rgba_data,
+            width,
+            height,
+        );
 
-            convert_bgr_to_rgba(rgb_buffer, image_data)?;
-
-            let pixel_buffer =
-                SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(rgb_buffer, width, height);
-
-            Ok(pixel_buffer)
-        }
-
-        // RGBA → usar from_rgba8 nativo con conversión BGRA→RGBA
-        len if len == expected_rgba => {
-            let mut pool = BUFFER_POOL.lock().unwrap();
-            let rgba_buffer = pool.get_buffer(expected_rgba);
-
-            convert_bgra_to_rgba(rgba_buffer, image_data)?;
-
-            let pixel_buffer =
-                SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(rgba_buffer, width, height);
-
-            Ok(pixel_buffer)
-        }
-
-        // MJPEG → decodificar y usar métodos nativos
-        _ => {
-            let decoded_image = image::load_from_memory(image_data)?;
-
-            let rgba_image = decoded_image.to_rgba8();
-            let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                rgba_image.as_raw(),
-                width,
-                height,
-            );
-
-            Ok(pixel_buffer)
-        }
+        return Ok(pixel_buffer);
     }
+
+    // OPCIÓN 2: RGB/BGR (24 bits) - Requiere agregar canal alfa y reordenar
+    if image_data.len() == expected_rgb {
+        let mut rgba_data = vec![0; expected_rgba];
+        
+        convert_bgr_to_rgba(&mut rgba_data, image_data)?;
+        
+        let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+            &rgba_data,
+            width,
+            height,
+        );
+
+        return Ok(pixel_buffer);
+    }
+
+    // OPCIÓN 3: MJPEG - Requiere decodificación
+    // No hay forma de evitar esta conversión
+    let decoded_image = image::load_from_memory(image_data)?;
+
+    // Decodificar directamente a RGBA8
+    let rgba_image = decoded_image.to_rgba8();
+    let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+        rgba_image.as_raw(),
+        width,
+        height,
+    );
+
+    Ok(pixel_buffer)
 }
 
-fn convert_bgr_to_rgba(rgb_buffer: &mut [u8], bgr_data: &[u8]) -> Result<()> {
-    // Para resoluciones altas, procesar en chunks
+/// Convierte BGR a RGBA
+/// 
+/// NOTA: Esta conversión es necesaria porque:
+/// 1. Nokhwa entrega datos en formato BGR (orden nativo de Windows/Linux)
+/// 2. Slint requiere datos en formato RGBA
+/// 
+/// Si en el futuro Slint soporta BGR nativamente, esta conversión
+/// podría eliminarse por completo para 0-overhead.
+fn convert_bgr_to_rgba(rgba_buffer: &mut [u8], bgr_data: &[u8]) -> Result<()> {
+    // Procesar píxel por píxel
     for (i, chunk) in bgr_data.chunks_exact(3).enumerate() {
-        let rgb_idx = i * 4;
+        let rgba_idx = i * 4;
 
-        rgb_buffer[rgb_idx] = chunk[2]; // R
-        rgb_buffer[rgb_idx + 1] = chunk[1]; // G
-        rgb_buffer[rgb_idx + 2] = chunk[0]; // B
-        rgb_buffer[rgb_idx + 3] = 255; // A
+        // Reordenar BGR → RGBA
+        rgba_buffer[rgba_idx] = chunk[2];     // R (era el byte 2)
+        rgba_buffer[rgba_idx + 1] = chunk[1]; // G (el byte 1 no cambia)
+        rgba_buffer[rgba_idx + 2] = chunk[0]; // B (era el byte 0)
+        rgba_buffer[rgba_idx + 3] = 255;       // A (siempre 255)
     }
 
     Ok(())
 }
 
+/// Convierte BGRA a RGBA
+/// 
+/// NOTA: Esta conversión es necesaria porque:
+/// 1. Nokhwa entrega datos en formato BGRA
+/// 2. Slint requiere datos en formato RGBA
+/// 
+/// Solo requiere reordenar los primeros 3 bytes.
 fn convert_bgra_to_rgba(rgba_buffer: &mut [u8], bgra_data: &[u8]) -> Result<()> {
+    // Procesar píxel por píxel
     for (i, chunk) in bgra_data.chunks_exact(4).enumerate() {
         let rgba_idx = i * 4;
 
-        rgba_buffer[rgba_idx] = chunk[2]; // R
-        rgba_buffer[rgba_idx + 1] = chunk[1]; // G
-        rgba_buffer[rgba_idx + 2] = chunk[0]; // B
-        rgba_buffer[rgba_idx + 3] = chunk[3]; // A
+        // Reordenar BGRA → RGBA
+        rgba_buffer[rgba_idx] = chunk[2];     // R (era el byte 2)
+        rgba_buffer[rgba_idx + 1] = chunk[1]; // G (el byte 1 no cambia)
+        rgba_buffer[rgba_idx + 2] = chunk[0]; // B (era el byte 0)
+        rgba_buffer[rgba_idx + 3] = chunk[3]; // A (el byte 3 no cambia)
     }
 
     Ok(())
