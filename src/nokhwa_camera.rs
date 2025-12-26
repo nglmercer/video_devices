@@ -15,9 +15,9 @@ pub use nokhwa::utils::CameraIndex as NokhwaIndex;
 
 use crate::slint_renderer;
 
-// Thread-local buffer para evitar contención de locks
+// Thread-local buffer para evitar contención de locks con pre-allocation
 thread_local! {
-    static LOCAL_RGBA_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+    static LOCAL_RGBA_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(1920 * 1080 * 4)); // Pre-allocar para 1080p
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +141,9 @@ where
             let frame_start = Instant::now();
             let result = camera_frame(&mut camera);
             
+            // Calcular tiempo de procesamiento inmediatamente después para precisión
+            let processing_time = frame_start.elapsed();
+            
             match &result {
                 Ok((_, fps)) => {
                     frame_times.push(1.0 / fps);
@@ -161,14 +164,13 @@ where
                 break;
             }
             
-            // Throttling adaptativo: dormir solo si es necesario
-            // Calcula el tiempo restante para mantener el target framerate
-            let elapsed = frame_start.elapsed();
-            if elapsed < target_frame_time {
-                let sleep_time = target_frame_time - elapsed;
-                // Solo dormir si hay tiempo significativo (>1ms)
-                if sleep_time > std::time::Duration::from_millis(1) {
-                    std::thread::sleep(sleep_time - std::time::Duration::from_millis(1));
+            // Throttling adaptativo mejorado: dormir solo si es necesario
+            // Usar processing_time calculado antes para mayor precisión
+            if processing_time < target_frame_time {
+                let sleep_time = target_frame_time - processing_time;
+                // Reducir umbral a 500μs para mejor responsividad
+                if sleep_time > std::time::Duration::from_micros(500) {
+                    std::thread::sleep(sleep_time);
                 }
             }
         }
@@ -186,9 +188,10 @@ fn camera_frame(
         .frame()
         .map_err(|e| anyhow!("Capturing frame: {e}"))?;
 
-    // Usar thread-local buffer para reducir contención
+    // Usar thread-local buffer con pre-allocation inteligente
     let image = LOCAL_RGBA_BUFFER.with(|local_buffer| {
         let mut temp_buffer = local_buffer.borrow_mut();
+        
         slint_renderer::render_frame_with_buffer(&mut temp_buffer, &buffer)
     })?;
 

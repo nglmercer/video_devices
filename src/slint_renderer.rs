@@ -31,7 +31,7 @@ pub static BUFFER_POOL: LazyLock<Arc<RwLock<BufferPool>>> =
 
 /// Función de conveniencia para renderizado rápido con buffer reutilizable
 pub fn render_frame_with_buffer(
-    temp_buffer: &mut Vec<u8>,
+    _temp_buffer: &mut Vec<u8>,
     buffer: &nokhwa::buffer::Buffer,
 ) -> Result<SharedPixelBuffer<Rgba8Pixel>> {
     let resolution = buffer.resolution();
@@ -43,32 +43,52 @@ pub fn render_frame_with_buffer(
     let expected_rgb = (width * height * 3) as usize;
     let expected_rgba = (width * height * 4) as usize;
 
-    // Asegurar que el buffer temporal tenga el tamaño correcto
-    if temp_buffer.len() != expected_rgba {
-        temp_buffer.resize(expected_rgba, 0);
-    }
+    // Usar buffer pool global con try_write para evitar bloqueos
+    let mut local_buffer = match BUFFER_POOL.try_write() {
+        Ok(mut pool) => {
+            let buffer_from_pool = pool.get_buffer(expected_rgba);
+            // Crear una copia para evitar problemas de lifetime
+            buffer_from_pool.clone()
+        },
+        Err(_) => {
+            // Fallback si hay contención - crear buffer temporal
+            vec![0; expected_rgba]
+        }
+    };
 
     // OPCIÓN 1: BGRA (32 bits) - Solo requiere reordenar canales
     if image_data.len() == expected_rgba {
-        convert_bgra_to_rgba(temp_buffer, image_data)?;
+        convert_bgra_to_rgba(&mut local_buffer, image_data)?;
         
         let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-            temp_buffer,
+            &local_buffer,
             width,
             height,
         );
+        
+        // Actualizar buffer pool en segundo plano si es posible
+        if let Ok(mut pool) = BUFFER_POOL.try_write() {
+            pool.buffers_pool.insert(expected_rgba, local_buffer);
+        }
+        
         return Ok(pixel_buffer);
     }
 
     // OPCIÓN 2: RGB/BGR (24 bits) - Requiere agregar canal alfa y reordenar
     if image_data.len() == expected_rgb {
-        convert_bgr_to_rgba(temp_buffer, image_data)?;
+        convert_bgr_to_rgba(&mut local_buffer, image_data)?;
         
         let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-            temp_buffer,
+            &local_buffer,
             width,
             height,
         );
+        
+        // Actualizar buffer pool en segundo plano si es posible
+        if let Ok(mut pool) = BUFFER_POOL.try_write() {
+            pool.buffers_pool.insert(expected_rgba, local_buffer);
+        }
+        
         return Ok(pixel_buffer);
     }
 
@@ -337,20 +357,27 @@ fn convert_bgra_to_rgba(rgba_buffer: &mut [u8], bgra_data: &[u8]) -> Result<()> 
     while bgra_idx + 64 <= bgra_data.len() {
         unsafe {
             // Cargar 16 píxeles BGRA (4 bytes cada uno)
-            let bgra = _mm_loadu_si128(bgra_data.as_ptr().add(bgra_idx) as *const __m128i);
+            let bgra1 = _mm_loadu_si128(bgra_data.as_ptr().add(bgra_idx) as *const __m128i);
             let bgra2 = _mm_loadu_si128(bgra_data.as_ptr().add(bgra_idx + 16) as *const __m128i);
             let bgra3 = _mm_loadu_si128(bgra_data.as_ptr().add(bgra_idx + 32) as *const __m128i);
             let bgra4 = _mm_loadu_si128(bgra_data.as_ptr().add(bgra_idx + 48) as *const __m128i);
             
-            // Reordenar canales B,G,R,A -> R,G,B,A
-            // Implementación simplificada - en producción usaría shuffle específico
-            let rgba = bgra; // Esto es simplificado - necesitaría shuffle real
-            let rgba2 = bgra2;
-            let rgba3 = bgra3;
-            let rgba4 = bgra4;
+            // Reordenar canales B,G,R,A -> R,G,B,A usando shuffle
+            // Máscara para convertir BGRA a RGBA: B→R, G→G, R→B, A→A
+            let swap_rb_mask = _mm_set_epi8(
+                12, 15, 14, 13,  // Swap R↔B en cada pixel
+                8, 11, 10, 9,    // A, B, G, R → A, R, G, B
+                4, 7, 6, 5,      //
+                0, 3, 2, 1       //
+            );
+            
+            let rgba1 = _mm_shuffle_epi8(bgra1, swap_rb_mask);
+            let rgba2 = _mm_shuffle_epi8(bgra2, swap_rb_mask);
+            let rgba3 = _mm_shuffle_epi8(bgra3, swap_rb_mask);
+            let rgba4 = _mm_shuffle_epi8(bgra4, swap_rb_mask);
             
             // Guardar resultados
-            _mm_storeu_si128(rgba_buffer.as_mut_ptr().add(rgba_idx) as *mut __m128i, rgba);
+            _mm_storeu_si128(rgba_buffer.as_mut_ptr().add(rgba_idx) as *mut __m128i, rgba1);
             _mm_storeu_si128(rgba_buffer.as_mut_ptr().add(rgba_idx + 16) as *mut __m128i, rgba2);
             _mm_storeu_si128(rgba_buffer.as_mut_ptr().add(rgba_idx + 32) as *mut __m128i, rgba3);
             _mm_storeu_si128(rgba_buffer.as_mut_ptr().add(rgba_idx + 48) as *mut __m128i, rgba4);
