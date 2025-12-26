@@ -4,7 +4,7 @@ use slint::Rgba8Pixel;
 use std::panic;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nokhwa::{
     pixel_format::{RgbAFormat, RgbFormat, YuyvFormat},
@@ -14,11 +14,6 @@ use nokhwa::{
 pub use nokhwa::utils::CameraIndex as NokhwaIndex;
 
 use crate::slint_renderer;
-
-// Thread-local buffer para evitar contención de locks con pre-allocation
-thread_local! {
-    static LOCAL_RGBA_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(1920 * 1080 * 4)); // Pre-allocar para 1080p
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraIndex(pub String);
@@ -60,30 +55,32 @@ pub fn create_camera(camera_index: NokhwaIndex) -> Result<nokhwa::Camera> {
         RequestedFormat::new::<YuyvFormat>(RequestedFormatType::AbsoluteHighestResolution),
     ];
 
-    let mut camera = requested_formats
-        .into_iter()
-        .enumerate()
-        .find_map(|(i, format)| {
-            match panic::catch_unwind(|| nokhwa::Camera::new(camera_index.clone(), format)) {
-                Ok(Ok(cam)) => {
-                    println!("✅ Cámara creada con formato {i}: {format:?}");
-                    Some(cam)
-                }
-                Ok(Err(e)) => {
-                    println!("⚠️  Formato {i} falló: {e}");
-                    None
-                }
-                Err(_) => {
-                    println!("❌ Panic durante inicialización del formato {i}");
-                    None
+    for (i, format) in requested_formats.into_iter().enumerate() {
+        match panic::catch_unwind(|| nokhwa::Camera::new(camera_index.clone(), format)) {
+            Ok(Ok(mut cam)) => {
+                println!("✅ Cámara creada con formato {i}");
+                
+                // Intentar abrir el stream inmediatamente
+                match cam.open_stream() {
+                    Ok(()) => return Ok(cam),
+                    Err(e) => {
+                        println!("⚠️  Formato {i}: Error al abrir stream: {e}");
+                        continue;
+                    }
                 }
             }
-        })
-        .ok_or_else(|| anyhow!("No se pudo crear la cámara con ningún formato soportado"))?;
-
-    camera.open_stream()?;
-
-    Ok(camera)
+            Ok(Err(e)) => {
+                println!("⚠️  Formato {i} falló: {e}");
+                continue;
+            }
+            Err(_) => {
+                eprintln!("❌ Panic durante inicialización del formato {i}");
+                continue;
+            }
+        }
+    }
+    
+    Err(anyhow!("No se pudo crear la cámara con ningún formato soportado"))
 }
 
 // Buffer circular para frame times - más eficiente que Vec
@@ -115,12 +112,68 @@ impl FrameTimeBuffer {
         self.count = 0;
     }
 
+    #[allow(dead_code)]
     fn average(&self) -> f64 {
         if self.count == 0 {
             return 0.0;
         }
         let sum: f64 = self.times.iter().take(self.count).sum();
         self.count as f64 / sum
+    }
+    
+    // Media móvil exponencial para respuesta más rápida a cambios
+    // Alpha de 0.3 da buen balance entre estabilidad y responsividad
+    fn ema(&self, alpha: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        
+        let mut ema = self.times[0];
+        for i in 1..self.count {
+            ema = alpha * self.times[i] + (1.0 - alpha) * ema;
+        }
+        ema
+    }
+}
+
+// Controlador PID adaptativo para throttling de frames
+struct PidController {
+    last_error: f64,
+    integral: f64,
+    kp: f64,  // Proporcional
+    ki: f64,  // Integral
+    kd: f64,  // Derivativo
+}
+
+impl PidController {
+    fn new() -> Self {
+        Self {
+            last_error: 0.0,
+            integral: 0.0,
+            // Optimización: Parámetros ajustados para mejor respuesta en video streaming
+            // kp=0.7: Respuesta proporcional más agresiva para correcciones rápidas
+            // ki=0.15: Integral aumentada para eliminar error steady-state
+            // kd=0.1: Derivativo mejorado para reducir overshoot y oscilaciones
+            kp: 0.7,
+            ki: 0.15,
+            kd: 0.1,
+        }
+    }
+    
+    fn compute(&mut self, target: Duration, actual: Duration) -> Duration {
+        let target_ms = target.as_secs_f64();
+        let actual_ms = actual.as_secs_f64();
+        let error = target_ms - actual_ms;
+        
+        self.integral += error;
+        // Clamp integral para evitar windup
+        self.integral = self.integral.clamp(-10.0, 10.0);
+        
+        let derivative = error - self.last_error;
+        self.last_error = error;
+        
+        let output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative);
+        Duration::from_secs_f64(output.max(0.0))
     }
 }
 
@@ -133,9 +186,10 @@ where
 
     std::thread::spawn(move || {
         let mut frame_times = FrameTimeBuffer::new();
+        let mut pid_controller = PidController::new();
         let mut last_fps_update = Instant::now();
-        let mut cached_fps = 0.0;
-        let target_frame_time = std::time::Duration::from_millis(16); // ~60 FPS
+        let mut cached_fps = 60.0; // Inicializar con 60 FPS como valor por defecto
+        let target_frame_time = Duration::from_millis(16); // ~60 FPS
         
         loop {
             let frame_start = Instant::now();
@@ -145,16 +199,21 @@ where
             let processing_time = frame_start.elapsed();
             
             match &result {
-                Ok((_, fps)) => {
-                    frame_times.push(1.0 / fps);
+                Ok(_) => {
+                    // Guardar el tiempo real entre frames (no 1/fps)
+                    frame_times.push(processing_time.as_secs_f64());
                 }
                 Err(_) => frame_times.clear(),
             }
             
-            // Calcular FPS promedio solo cada segundo para reducir overhead
+            // Calcular FPS usando EMA para respuesta más rápida (actualizar cada 200ms)
             let now = Instant::now();
-            if now.duration_since(last_fps_update).as_secs() >= 1 {
-                cached_fps = frame_times.average();
+            if now.duration_since(last_fps_update).as_millis() >= 200 {
+                // Calcular FPS como inverso del promedio de tiempos
+                let avg_time = frame_times.ema(0.3);
+                if avg_time > 0.0 {
+                    cached_fps = 1.0 / avg_time;
+                }
                 last_fps_update = now;
             }
             
@@ -164,14 +223,11 @@ where
                 break;
             }
             
-            // Throttling adaptativo mejorado: dormir solo si es necesario
-            // Usar processing_time calculado antes para mayor precisión
+            // Throttling con controlador PID para mayor estabilidad
             if processing_time < target_frame_time {
-                let sleep_time = target_frame_time - processing_time;
-                // Reducir umbral a 500μs para mejor responsividad
-                if sleep_time > std::time::Duration::from_micros(500) {
-                    std::thread::sleep(sleep_time);
-                }
+                let sleep_time = pid_controller.compute(target_frame_time, processing_time);
+                // Usar spin_sleep para mayor precisión en sleeps cortos
+                spin_sleep::sleep(sleep_time);
             }
         }
     });
@@ -182,23 +238,18 @@ where
 fn camera_frame(
     camera: &mut nokhwa::Camera,
 ) -> Result<(slint::SharedPixelBuffer<Rgba8Pixel>, f64)> {
-    let start_time = Instant::now();
+    // Optimización: Eliminar cálculo de FPS redundante
+    // El FPS real se calcula en create_camera_stream usando EMA
+    let _start_time = Instant::now();
 
     let buffer = camera
         .frame()
         .map_err(|e| anyhow!("Capturing frame: {e}"))?;
 
-    // Usar thread-local buffer con pre-allocation inteligente
-    let image = LOCAL_RGBA_BUFFER.with(|local_buffer| {
-        let mut temp_buffer = local_buffer.borrow_mut();
-        
-        slint_renderer::render_frame_with_buffer(&mut temp_buffer, &buffer)
-    })?;
+    // Usar buffer pool optimizado sin thread-local buffer innecesario
+    let image = slint_renderer::render_frame_with_buffer(&buffer)?;
 
-    let render_time = start_time.elapsed();
-    let fps = 1.0 / render_time.as_secs_f64();
-
-    Ok((image, fps))
+    Ok((image, 0.0)) // FPS ignorado, calculado en create_camera_stream
 }
 
 // Optimización: usar AtomicBool con Ordering más eficiente

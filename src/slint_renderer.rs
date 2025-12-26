@@ -31,7 +31,6 @@ pub static BUFFER_POOL: LazyLock<Arc<RwLock<BufferPool>>> =
 
 /// Función de conveniencia para renderizado rápido con buffer reutilizable
 pub fn render_frame_with_buffer(
-    _temp_buffer: &mut Vec<u8>,
     buffer: &nokhwa::buffer::Buffer,
 ) -> Result<SharedPixelBuffer<Rgba8Pixel>> {
     let resolution = buffer.resolution();
@@ -46,15 +45,20 @@ pub fn render_frame_with_buffer(
     // Usar buffer pool global con try_write para evitar bloqueos
     let mut local_buffer = match BUFFER_POOL.try_write() {
         Ok(mut pool) => {
-            let buffer_from_pool = pool.get_buffer(expected_rgba);
-            // Crear una copia para evitar problemas de lifetime
-            buffer_from_pool.clone()
+            // Usar mem::take para obtener ownership sin clonar
+            std::mem::take(pool.get_buffer(expected_rgba))
         },
         Err(_) => {
             // Fallback si hay contención - crear buffer temporal
             vec![0; expected_rgba]
         }
     };
+
+    // Asegurar capacidad correcta
+    if local_buffer.capacity() < expected_rgba {
+        local_buffer.reserve(expected_rgba - local_buffer.capacity());
+    }
+    unsafe { local_buffer.set_len(expected_rgba); }
 
     // OPCIÓN 1: BGRA (32 bits) - Solo requiere reordenar canales
     if image_data.len() == expected_rgba {
@@ -66,7 +70,7 @@ pub fn render_frame_with_buffer(
             height,
         );
         
-        // Actualizar buffer pool en segundo plano si es posible
+        // Devolver buffer al pool
         if let Ok(mut pool) = BUFFER_POOL.try_write() {
             pool.buffers_pool.insert(expected_rgba, local_buffer);
         }
@@ -84,7 +88,7 @@ pub fn render_frame_with_buffer(
             height,
         );
         
-        // Actualizar buffer pool en segundo plano si es posible
+        // Devolver buffer al pool
         if let Ok(mut pool) = BUFFER_POOL.try_write() {
             pool.buffers_pool.insert(expected_rgba, local_buffer);
         }
@@ -104,115 +108,10 @@ pub fn render_frame_with_buffer(
     Ok(pixel_buffer)
 }
 
-/// Función original para compatibilidad hacia atrás
+/// Función original para compatibilidad hacia atrás (delegada a la optimizada)
 #[allow(dead_code)]
 pub fn render_frame(buffer: &nokhwa::buffer::Buffer) -> Result<SharedPixelBuffer<Rgba8Pixel>> {
-    let resolution = buffer.resolution();
-    let width = resolution.width();
-    let height = resolution.height();
-
-    let image_data = buffer.buffer();
-
-    let expected_rgb = (width * height * 3) as usize;
-    let expected_rgba = (width * height * 4) as usize;
-
-    // OPCIÓN 1: BGRA (32 bits) - Solo requiere reordenar canales
-    if image_data.len() == expected_rgba {
-        // Usar buffer pool con RwLock para permitir múltiples lectores
-        match BUFFER_POOL.try_read() {
-            Ok(pool) => {
-                // Crear una copia del buffer para evitar problemas de lifetime
-                let mut temp_buffer = vec![0; expected_rgba];
-                if let Some(cached_buffer) = pool.buffers_pool.get(&expected_rgba) {
-                    temp_buffer.copy_from_slice(cached_buffer);
-                }
-                drop(pool); // Liberar el lock antes de procesamiento
-                
-                convert_bgra_to_rgba(&mut temp_buffer, image_data)?;
-                
-                let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                    &temp_buffer,
-                    width,
-                    height,
-                );
-                
-                // Actualizar el buffer pool en segundo plano
-                if let Ok(mut write_pool) = BUFFER_POOL.try_write() {
-                    write_pool.buffers_pool.insert(expected_rgba, temp_buffer);
-                }
-                
-                return Ok(pixel_buffer);
-            }
-            Err(_) => {
-                // Si no se puede obtener el lock, crear buffer temporal
-                let mut temp_buffer = vec![0; expected_rgba];
-                convert_bgra_to_rgba(&mut temp_buffer, image_data)?;
-                
-                let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                    &temp_buffer,
-                    width,
-                    height,
-                );
-                return Ok(pixel_buffer);
-            }
-        }
-    }
-
-    // OPCIÓN 2: RGB/BGR (24 bits) - Requiere agregar canal alfa y reordenar
-    if image_data.len() == expected_rgb {
-        // Usar buffer pool con RwLock para permitir múltiples lectores
-        match BUFFER_POOL.try_read() {
-            Ok(pool) => {
-                // Crear una copia del buffer para evitar problemas de lifetime
-                let mut temp_buffer = vec![0; expected_rgba];
-                if let Some(cached_buffer) = pool.buffers_pool.get(&expected_rgba) {
-                    temp_buffer.copy_from_slice(cached_buffer);
-                }
-                drop(pool); // Liberar el lock antes de procesamiento
-                
-                convert_bgr_to_rgba(&mut temp_buffer, image_data)?;
-                
-                let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                    &temp_buffer,
-                    width,
-                    height,
-                );
-                
-                // Actualizar el buffer pool en segundo plano
-                if let Ok(mut write_pool) = BUFFER_POOL.try_write() {
-                    write_pool.buffers_pool.insert(expected_rgba, temp_buffer);
-                }
-                
-                return Ok(pixel_buffer);
-            }
-            Err(_) => {
-                // Si no se puede obtener el lock, crear buffer temporal
-                let mut temp_buffer = vec![0; expected_rgba];
-                convert_bgr_to_rgba(&mut temp_buffer, image_data)?;
-                
-                let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                    &temp_buffer,
-                    width,
-                    height,
-                );
-                return Ok(pixel_buffer);
-            }
-        }
-    }
-
-    // OPCIÓN 3: MJPEG - Requiere decodificación
-    // No hay forma de evitar esta conversión
-    let decoded_image = image::load_from_memory(image_data)?;
-
-    // Decodificar directamente a RGBA8
-    let rgba_image = decoded_image.to_rgba8();
-    let pixel_buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-        rgba_image.as_raw(),
-        width,
-        height,
-    );
-
-    Ok(pixel_buffer)
+    render_frame_with_buffer(buffer)
 }
 
 /// Convierte BGR a RGBA con optimización SIMD

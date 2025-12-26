@@ -7,11 +7,67 @@ use nokhwa::utils::{ApiBackend, CameraInfo};
 use slint::{ComponentHandle, VecModel};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::nokhwa_camera::CameraIndex;
 
 pub mod ui {
     slint::include_modules!();
+}
+
+// Throttler para limitar actualizaciones de UI y reducir overhead
+struct UiUpdateThrottler {
+    last_update: Instant,
+    min_interval: Duration,
+}
+
+impl UiUpdateThrottler {
+    fn new(min_interval_ms: u64) -> Self {
+        Self {
+            last_update: Instant::now(),
+            min_interval: Duration::from_millis(min_interval_ms),
+        }
+    }
+    
+    fn should_update(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.last_update) >= self.min_interval {
+            self.last_update = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// Cache para queries de cámara con TTL (reservado para uso futuro)
+#[allow(dead_code)]
+struct CachedCameraQuery {
+    cameras: Vec<CameraInfo>,
+    last_update: Instant,
+    ttl: Duration,
+}
+
+#[allow(dead_code)]
+impl CachedCameraQuery {
+    fn new() -> Self {
+        Self {
+            cameras: Vec::new(),
+            last_update: Instant::now() - Duration::from_secs(10),
+            ttl: Duration::from_secs(5),
+        }
+    }
+    
+    #[allow(dead_code)]
+    fn get(&mut self) -> Result<&[CameraInfo]> {
+        if Instant::now().duration_since(self.last_update) >= self.ttl {
+            self.cameras = nokhwa::query(ApiBackend::Auto)
+                .map_err(|e| anyhow!("Cannot detect cameras: {e}"))?;
+            self.last_update = Instant::now();
+        }
+        Ok(&self.cameras)
+    }
 }
 
 fn main() -> Result<()> {
@@ -43,6 +99,56 @@ impl AppWeak {
 struct AppState {
     cameras: RefCell<Vec<CameraInfo>>,
     current_camera: RefCell<Option<nokhwa_camera::CameraAbort>>,
+    camera_error_state: Arc<CameraErrorState>,
+    #[allow(dead_code)]
+    cached_camera_query: CachedCameraQuery,
+}
+
+// Estado de errores específico por cámara - mejor aislamiento
+struct CameraErrorState {
+    error_count: std::sync::atomic::AtomicUsize,
+    last_error_time: std::sync::atomic::AtomicU64,
+}
+
+impl CameraErrorState {
+    fn new() -> Self {
+        Self {
+            error_count: std::sync::atomic::AtomicUsize::new(0),
+            last_error_time: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn increment_error(&self) -> usize {
+        self.error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reset_errors(&self) {
+        self.error_count.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn should_log_error(&self) -> bool {
+        use std::time::SystemTime;
+        
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        
+        let last_time = self.last_error_time.load(std::sync::atomic::Ordering::Relaxed);
+        
+        // Solo mostrar errores cada 2 segundos (2000ms)
+        if now_ms.saturating_sub(last_time) >= 2000 {
+            if self.last_error_time.compare_exchange(
+                last_time,
+                now_ms,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed
+            ).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 struct App {
@@ -64,6 +170,8 @@ impl App {
             state: Rc::new(AppState {
                 cameras: RefCell::new(Vec::new()),
                 current_camera: RefCell::new(None),
+                camera_error_state: Arc::new(CameraErrorState::new()),
+                cached_camera_query: CachedCameraQuery::new(),
             }),
         })
     }
@@ -179,63 +287,59 @@ impl App {
                         app.camera_manager().set_is_camera_active(true);
 
                         let window = app.as_weak().window;
+                        let error_state = app.state.camera_error_state.clone();
+                        let ui_throttler = std::sync::Arc::new(std::sync::Mutex::new(
+                            UiUpdateThrottler::new(33) // ~30 FPS UI updates
+                        ));
+                        
                         let camera_stream = nokhwa_camera::create_camera_stream(
                             camera,
                             move |result| match result {
                                 Ok((frame, fps)) => {
-                                    // Batch de actualizaciones de UI para reducir overhead
-                                    _ = window.upgrade_in_event_loop(move |w| {
-                                        let image = slint::Image::from_rgba8(frame);
-                                        let manager = w.global::<ui::CameraManager>();
+                                    // Resetear contador de errores en frames exitosos
+                                    error_state.reset_errors();
+                                    
+                                    // Usar throttler para limitar actualizaciones de UI
+                                    let should_update = ui_throttler.lock().unwrap().should_update();
+                                    
+                                    if should_update {
+                                        _ = window.upgrade_in_event_loop(move |w| {
+                                            let image = slint::Image::from_rgba8(frame);
+                                            let manager = w.global::<ui::CameraManager>();
 
-                                        // Ignore frames that comes after camera stops
-                                        if !manager.get_is_camera_active() {
-                                            return;
-                                        }
+                                            // Ignore frames that comes after camera stops
+                                            if !manager.get_is_camera_active() {
+                                                return;
+                                            }
 
-                                        // Actualizar frame y FPS en una sola llamada
-                                        manager.set_camera_frame(image);
-                                        manager.set_fps(fps.round() as i32);
+                                            // Actualizar frame y FPS en una sola llamada
+                                            manager.set_camera_frame(image);
+                                            manager.set_fps(fps.round() as i32);
 
-                                        // Streaming means there's at least one frame
-                                        if !manager.get_is_streaming() {
-                                            manager.set_is_streaming(true);
-                                        }
-                                    });
+                                            // Streaming means there's at least one frame
+                                            if !manager.get_is_streaming() {
+                                                manager.set_is_streaming(true);
+                                            }
+                                        });
+                                    }
                                 }
                                 Err(e) => {
-                                    // Sistema de manejo de errores simplificado y eficiente
-                                    use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+                                    // Sistema de manejo de errores mejorado con estado por cámara
+                                    let current_count = error_state.increment_error();
                                     
-                                    static ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
-                                    static LAST_ERROR_TIME: AtomicU64 = AtomicU64::new(0);
-                                    
-                                    // Incrementar contador de errores de forma atómica
-                                    let current_count = ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                                    
-                                    // Simplificar tiempo a milisegundos desde epoch
-                                    let now_ms = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as u64;
-                                    
-                                    let last_time = LAST_ERROR_TIME.load(Ordering::Relaxed);
-                                    
-                                    // Solo mostrar errores cada 2 segundos (2000ms)
-                                    if now_ms.saturating_sub(last_time) >= 2000 {
-                                        if LAST_ERROR_TIME.compare_exchange(last_time, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                                            eprintln!("Frame error #{current_count}: {e}");
-                                            let error_msg = format!("Error (#{current_count}): {e}");
-                                            _ = window.upgrade_in_event_loop(move |w| {
-                                                w.set_status_text(error_msg.into());
-                                                w.set_status_state(ui::StatusState::Error)
-                                            });
-                                        }
+                                    // Solo mostrar errores cada 2 segundos para reducir spam
+                                    if error_state.should_log_error() {
+                                        eprintln!("Frame error #{current_count}: {e}");
+                                        let error_msg = format!("Error (#{current_count}): {e}");
+                                        _ = window.upgrade_in_event_loop(move |w| {
+                                            w.set_status_text(error_msg.into());
+                                            w.set_status_state(ui::StatusState::Error)
+                                        });
                                     }
                                     
                                     // Stop camera if too many consecutive errors
                                     if current_count >= 100 {
-                                        ERROR_COUNT.store(0, Ordering::Relaxed);
+                                        error_state.reset_errors();
                                         _ = window.upgrade_in_event_loop(move |w| {
                                             let manager = w.global::<ui::CameraManager>();
                                             manager.set_is_camera_active(false);
@@ -277,6 +381,9 @@ impl App {
                 app.camera_manager().set_is_camera_active(false);
                 app.camera_manager().set_is_streaming(false);
                 app.set_status(StatusState::Normal(Self::STATUS_CAMERA_STOPPED.to_string()));
+                
+                // Resetear estado de errores al detener cámara
+                app.state.camera_error_state.reset_errors();
                 // app.window.invoke_refresh_pause_icon();
             }
         });
