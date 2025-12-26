@@ -205,28 +205,39 @@ impl App {
                                     });
                                 }
                                 Err(e) => {
-                                    use std::sync::atomic::{AtomicUsize, Ordering};
+                                    // Sistema de manejo de errores lock-free con Atomic
+                                    use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+                                    
                                     static ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
-                                    static LAST_ERROR_TIME: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
+                                    static LAST_ERROR_TIME: AtomicU64 = AtomicU64::new(0);
                                     
-                                    let count = ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                                    
-                                    // Solo mostrar errores cada 2 segundos para reducir overhead
-                                    let last_error_time = LAST_ERROR_TIME.get_or_init(|| std::sync::Mutex::new(Instant::now()));
-                                    let mut last_time = last_error_time.lock().unwrap();
+                                    // Incrementar contador de errores de forma atómica
+                                    let current_count = ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                                     let now = Instant::now();
                                     
-                                    if now.duration_since(*last_time).as_secs() >= 2 {
-                                        *last_time = now;
-                                        eprintln!("Frame error #{count}: {e}");
-                                        _ = window.upgrade_in_event_loop(move |w| {
-                                            w.set_status_text(format!("Error (#{count}): {e}").into());
-                                            w.set_status_state(ui::StatusState::Error)
-                                        });
+                                    // Usar duración desde un punto fijo en nanosegundos
+                                    static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+                                    let start_time = START_TIME.get_or_init(|| Instant::now());
+                                    let now_nanos = now.duration_since(*start_time).as_nanos() as u64;
+                                    
+                                    // Obtener último tiempo de error y actualizar si es necesario
+                                    let last_time = LAST_ERROR_TIME.load(Ordering::Relaxed);
+                                    let time_diff = now_nanos.saturating_sub(last_time);
+                                    
+                                    // Solo mostrar errores cada 2 segundos (2_000_000_000 nanos)
+                                    if time_diff >= 2_000_000_000 {
+                                        if LAST_ERROR_TIME.compare_exchange(last_time, now_nanos, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                            eprintln!("Frame error #{current_count}: {e}");
+                                            let error_msg = format!("Error (#{current_count}): {e}");
+                                            _ = window.upgrade_in_event_loop(move |w| {
+                                                w.set_status_text(error_msg.into());
+                                                w.set_status_state(ui::StatusState::Error)
+                                            });
+                                        }
                                     }
                                     
                                     // Stop camera if too many consecutive errors
-                                    if count >= 100 {
+                                    if current_count >= 100 {
                                         ERROR_COUNT.store(0, Ordering::Relaxed);
                                         _ = window.upgrade_in_event_loop(move |w| {
                                             let manager = w.global::<ui::CameraManager>();

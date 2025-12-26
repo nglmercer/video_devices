@@ -15,6 +15,11 @@ pub use nokhwa::utils::CameraIndex as NokhwaIndex;
 
 use crate::slint_renderer;
 
+// Thread-local buffer para evitar contención de locks
+thread_local! {
+    static LOCAL_RGBA_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraIndex(pub String);
 
@@ -81,6 +86,44 @@ pub fn create_camera(camera_index: NokhwaIndex) -> Result<nokhwa::Camera> {
     Ok(camera)
 }
 
+// Buffer circular para frame times - más eficiente que Vec
+struct FrameTimeBuffer {
+    times: [f64; 60],
+    index: usize,
+    count: usize,
+}
+
+impl FrameTimeBuffer {
+    fn new() -> Self {
+        Self {
+            times: [0.0; 60],
+            index: 0,
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, time: f64) {
+        self.times[self.index] = time;
+        self.index = (self.index + 1) % 60;
+        if self.count < 60 {
+            self.count += 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.index = 0;
+        self.count = 0;
+    }
+
+    fn average(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let sum: f64 = self.times.iter().take(self.count).sum();
+        self.count as f64 / sum
+    }
+}
+
 pub fn create_camera_stream<C>(mut camera: nokhwa::Camera, mut callback: C) -> CameraAbort
 where
     C: FnMut(Result<(slint::SharedPixelBuffer<Rgba8Pixel>, f64)>) + Send + 'static,
@@ -89,9 +132,10 @@ where
     let camera_abort = CameraAbort(abort.clone());
 
     std::thread::spawn(move || {
-        let mut frame_times: Vec<f64> = Vec::with_capacity(60);
+        let mut frame_times = FrameTimeBuffer::new();
         let mut last_fps_update = Instant::now();
         let mut cached_fps = 0.0;
+        let target_frame_time = std::time::Duration::from_millis(16); // ~60 FPS
         
         loop {
             let frame_start = Instant::now();
@@ -100,9 +144,6 @@ where
             match &result {
                 Ok((_, fps)) => {
                     frame_times.push(1.0 / fps);
-                    if frame_times.len() > 60 {
-                        frame_times.remove(0);
-                    }
                 }
                 Err(_) => frame_times.clear(),
             }
@@ -110,11 +151,7 @@ where
             // Calcular FPS promedio solo cada segundo para reducir overhead
             let now = Instant::now();
             if now.duration_since(last_fps_update).as_secs() >= 1 {
-                cached_fps = if frame_times.is_empty() {
-                    0.0
-                } else {
-                    frame_times.len() as f64 / frame_times.iter().sum::<f64>()
-                };
+                cached_fps = frame_times.average();
                 last_fps_update = now;
             }
             
@@ -124,12 +161,15 @@ where
                 break;
             }
             
-            // Throttling: dormir brevemente para reducir uso de CPU
-            // Esto permite que el hilo no consuma 100% CPU cuando la cámara
-            // no puede mantener altos framerates
+            // Throttling adaptativo: dormir solo si es necesario
+            // Calcula el tiempo restante para mantener el target framerate
             let elapsed = frame_start.elapsed();
-            if elapsed.as_millis() < 16 { // Aprox 60 FPS max
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            if elapsed < target_frame_time {
+                let sleep_time = target_frame_time - elapsed;
+                // Solo dormir si hay tiempo significativo (>1ms)
+                if sleep_time > std::time::Duration::from_millis(1) {
+                    std::thread::sleep(sleep_time - std::time::Duration::from_millis(1));
+                }
             }
         }
     });
@@ -146,7 +186,11 @@ fn camera_frame(
         .frame()
         .map_err(|e| anyhow!("Capturing frame: {e}"))?;
 
-    let image = slint_renderer::render_frame(&buffer)?;
+    // Usar thread-local buffer para reducir contención
+    let image = LOCAL_RGBA_BUFFER.with(|local_buffer| {
+        let mut temp_buffer = local_buffer.borrow_mut();
+        slint_renderer::render_frame_with_buffer(&mut temp_buffer, &buffer)
+    })?;
 
     let render_time = start_time.elapsed();
     let fps = 1.0 / render_time.as_secs_f64();
@@ -154,16 +198,34 @@ fn camera_frame(
     Ok((image, fps))
 }
 
+// Optimización: usar AtomicBool con Ordering más eficiente
 pub struct CameraAbort(Arc<AtomicBool>);
 
 impl CameraAbort {
     pub fn abort(self) {
-        self.0.store(true, Ordering::Relaxed);
+        // Usar Release ordering para asegurar que todos los writes anteriores sean visibles
+        self.0.store(true, Ordering::Release);
     }
 }
 
 impl Drop for CameraAbort {
     fn drop(&mut self) {
+        // Relaxed es suficiente aquí ya que es el último acceso
         self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+// Asegurar que el hilo se limpie adecuadamente
+#[allow(dead_code)]
+impl CameraAbort {
+    pub fn wait_for_completion(&self, timeout: std::time::Duration) -> bool {
+        let start = Instant::now();
+        while !self.0.load(Ordering::Acquire) {
+            if start.elapsed() > timeout {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
     }
 }
